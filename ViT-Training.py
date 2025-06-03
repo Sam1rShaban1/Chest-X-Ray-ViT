@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from google.colab import auth
 from google.cloud import storage
 import io
 import pandas as pd
@@ -18,9 +17,6 @@ from sklearn.metrics import roc_auc_score
 from tqdm.notebook import tqdm
 from transformers import ViTForImageClassification, ViTImageProcessor
 from transformers import TrainingArguments, Trainer
-import evaluate
-
-print("Libraries installed and imported.")
 
 from tqdm import tqdm # Standard tqdm for terminal output
 
