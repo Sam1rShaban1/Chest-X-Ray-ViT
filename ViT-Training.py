@@ -1,25 +1,26 @@
 # --- Library Imports ---
 import os
 import numpy as np
-import pandas as pd
 from PIL import Image, ImageDraw
 import matplotlib.pyplot as plt
-import io
-
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-
-from transformers import ViTForImageClassification, ViTImageProcessor, TrainingArguments, Trainer
+from torchvision import transforms
+from google.colab import auth
+from google.cloud import storage
+import io
+import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.metrics import roc_auc_score
+from tqdm.notebook import tqdm
+from transformers import ViTForImageClassification, ViTImageProcessor
+from transformers import TrainingArguments, Trainer
+import evaluate
 
-from google.cloud import storage
-
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
+print("Libraries installed and imported.")
 
 from tqdm import tqdm # Standard tqdm for terminal output
 
