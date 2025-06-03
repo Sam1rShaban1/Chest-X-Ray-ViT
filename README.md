@@ -1,153 +1,91 @@
-﻿# Chest X-Ray Classification using Vision Transformers (ViT)
+﻿
+# 🩺 Chest X-Ray Classification using Vision Transformers (ViT)
 
-This project fine-tunes a pre-trained Vision Transformer (ViT) model to classify chest X-ray images from the NIH Chest X-ray dataset using PyTorch. The training is performed on TPUs with data loading from Google Cloud Storage (GCS).
+This project fine-tunes a pre-trained Vision Transformer (ViT) on the NIH Chest X-ray dataset to perform multi-label classification of thoracic diseases. It uses Google Cloud TPUs for acceleration and integrates with Google Cloud Storage for dataset access and model checkpointing.
+
+---
+
+## 🧠 Model Architecture
+
+- **Model**: `google/vit-base-patch16-384`
+  - Pre-trained on ImageNet-1k
+  - Input Resolution: `384x384`
+- **Normalization**
+  - `mean`: `[0.485, 0.456, 0.406]`
+  - `std`: `[0.229, 0.224, 0.225]`
+
+---
+
+## ⚙️ Hyperparameters
+
+| Parameter            | Value     |
+|----------------------|-----------|
+| `IMG_SIZE`           | 384       |
+| `BATCH_SIZE_PER_CORE`| 16        |
+| `LEARNING_RATE`      | 2e-4      |
+| `WEIGHT_DECAY`       | 0.01      |
+| `NUM_EPOCHS`         | 4         |
+| `NUM_WORKERS`        | 8         |
+| `USE_SUBSET_DATA`    | None (use full dataset) |
+
+---
 
 ## 📁 Project Structure
 
 ```
 .
-├── ViT-Training.py              # Main training script
-├── requirements.txt             # Dependencies for the project
-├── utils/
-│   └── data_utils.py            # Custom dataset, preprocessing, and data loaders
-├── config.yaml (optional)      # For hyperparameters and environment configs
-└── README.md                    # Project overview and instructions
-```
-
-## 🚀 Features
-
-- ✅ Fine-tuning HuggingFace ViT model (`google/vit-base-patch16-384`)
-- ✅ TPU training with `torch_xla`
-- ✅ Efficient GCS integration with `gcsfs`
-- ✅ Multiclass classification with NIH Chest X-ray labels
-- ✅ Mixed precision support
-- ✅ AUROC metric tracking
-
----
-
-## 📦 Installation
-
-### 1. Clone this repo
-
-```bash
-git clone https://github.com/Sam1rShaban1/Chest-X-Ray-ViT.git
-cd Chest-X-Ray-ViT
-```
-
-### 2. Create a virtual environment
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install requirements
-
-```bash
-pip install -r requirements.txt
-```
-
-For TPU:
-```bash
-pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
+├── ViT-Training.py        # Main training script
+├── requirements.txt       # Python dependencies
+├── README.md              # Project documentation
+├── data/                  # (Optional) Local data folder if not using GCS
+└── outputs/               # Saved models and logs
 ```
 
 ---
 
-## ☁️ Google Cloud Setup
+## ☁️ Cloud TPU & GCS Setup
 
-### 1. Upload your NIH dataset to a GCS bucket
+To train on a TPU VM with access to NIH Chest X-rays on Google Cloud:
 
-Example structure:
-```
-gs://your-bucket/chest-xray-data/images/
-gs://your-bucket/chest-xray-data/Data_Entry_2017.csv
-```
+1. **Upload NIH dataset to Google Cloud Storage**:
+   ```bash
+   gsutil -m cp -r ./data gs://<your-bucket-name>/nih-chest-xray
+   ```
 
-### 2. Set your Google Cloud credentials
+2. **Launch TPU VM**:
+   ```bash
+   gcloud compute tpus tpu-vm create vit-tpu        --zone=us-central1-b        --accelerator-type=v3-8        --version=tpu-ubuntu2204-base
+   ```
 
-```bash
-export GOOGLE_APPLICATION_CREDENTIALS="path/to/your/service-account.json"
-```
+3. **SSH into TPU VM**:
+   ```bash
+   gcloud compute tpus tpu-vm ssh vit-tpu --zone=us-central1-b
+   ```
 
----
+4. **Clone repo & install dependencies**:
+   ```bash
+   sudo apt update
+   sudo apt install python3-pip -y
+   pip install -r requirements.txt
+   ```
 
-## 🧠 Training the Model
-
-Run training on a TPU:
-
-```bash
-python ViT-Training.py \
-  --bucket_name your-bucket \
-  --data_dir chest-xray-data \
-  --batch_size 32 \
-  --epochs 10 \
-  --lr 3e-5
-```
-
-### Optional Flags
-
-- `--image_size`: Resize input image (default: 384)
-- `--precision`: Enable mixed precision (default: False)
-- `--tpu`: Enable TPU training (default: True)
+5. **Run training**:
+   ```bash
+   python ViT-Training.py
+   ```
 
 ---
 
-## 📊 Evaluation
+## 📝 Notes
 
-- The script logs AUROC per label on the validation and test sets.
-- You can modify the script to save the best model weights to either GCS or local disk.
-
----
-
-## 📝 NIH Labels
-
-Supported 15 chest pathology labels:
-```
-['Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration', 'Mass',
- 'Nodule', 'Pneumonia', 'Pneumothorax', 'Consolidation', 'Edema',
- 'Emphysema', 'Fibrosis', 'Pleural_Thickening', 'Hernia', 'No Finding']
-```
-
-Multi-label one-hot vectors are used as ground truth.
+- Training uses **multi-label classification** (e.g., a single image can have multiple diseases).
+- For faster testing, set `USE_SUBSET_DATA = 1000` in the script.
+- Save logs and checkpoints automatically in `./outputs/`.
 
 ---
 
-## 📈 Results
+## ✅ TODO
 
-You can expect AUROC values per label. Save results using:
-
-```python
-torch.save(model.state_dict(), "vit_chestxray_best.pth")
-```
-
-or to GCS:
-
-```python
-fs = gcsfs.GCSFileSystem()
-with fs.open('gs://your-bucket/models/vit_chestxray_best.pth', 'wb') as f:
-    torch.save(model.state_dict(), f)
-```
-
----
-
-## 🛠️ TODO
-
-- [ ] Add confusion matrix visualization
-- [ ] Implement learning rate scheduler
-- [ ] Add TensorBoard/XLA metrics
-- [ ] Improve image augmentations
-
----
-
-## 📚 References
-
-- [NIH Chest X-ray Dataset](https://www.kaggle.com/nih-chest-xrays/data)
-- [Hugging Face Transformers - ViT](https://huggingface.co/google/vit-base-patch16-224-in21k)
-- [PyTorch/XLA TPU Docs](https://pytorch.org/xla/)
-
----
-
-## 👨‍⚕️ Authors
-
-- **Samir Shabani** 
+- [ ] Add evaluation metrics (AUC, F1)
+- [ ] Visualize attention maps (Grad-CAM)
+- [ ] Export trained model for inference
