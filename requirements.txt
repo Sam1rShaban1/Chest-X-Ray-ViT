@@ -7,8 +7,9 @@ torch_xla[tpu]~=2.5.0
 transformers
 accelerate
 bitsandbytes
-tensorflow
+tensorflow-cpu
 tf-keras
+cloud-tpu-client
 
 # Data handling and utility libraries
 numpy
