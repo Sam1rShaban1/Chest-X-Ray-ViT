@@ -7,6 +7,8 @@ torch_xla[tpu]~=2.5.0
 transformers
 accelerate
 bitsandbytes
+tensorflow
+tf-keras
 
 # Data handling and utility libraries
 numpy
