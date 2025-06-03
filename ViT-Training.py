@@ -1,24 +1,38 @@
 # --- Library Imports ---
-import os
-import numpy as np
-from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from google.cloud import storage
-import io
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.metrics import roc_auc_score
-from tqdm.notebook import tqdm
-from transformers import ViTForImageClassification, ViTImageProcessor
-from transformers import TrainingArguments, Trainer
+import os  # Operating system interface
+import io  # Handling byte streams
 
-from tqdm import tqdm # Standard tqdm for terminal output
+# --- Image Processing ---
+from PIL import Image, ImageDraw  # Image handling and annotation
+import matplotlib.pyplot as plt  # Plotting for training curves and visualizations
+
+# --- Scientific and Numeric Libraries ---
+import numpy as np  # Numerical operations
+import pandas as pd  # Data manipulation and CSV handling
+
+# --- Machine Learning: Preprocessing & Evaluation ---
+from sklearn.model_selection import train_test_split  # Splitting datasets
+from sklearn.preprocessing import MultiLabelBinarizer  # Multi-label binarization
+from sklearn.metrics import roc_auc_score  # AUROC evaluation metric
+
+# --- PyTorch Core ---
+import torch  # Main PyTorch library
+import torch.nn as nn  # Neural network layers
+import torch.optim as optim  # Optimizers
+from torch.utils.data import Dataset, DataLoader  # Custom dataset and batch loading
+from torchvision import transforms  # Image transformations
+
+# --- TPU & GCS Integration ---
+from google.cloud import storage  # Google Cloud Storage API for TPU data loading
+
+# --- Progress Bar ---
+from tqdm.notebook import tqdm  # For notebook-based progress bars
+from tqdm import tqdm  # For terminal-based progress bars
+
+# --- Hugging Face Transformers ---
+from transformers import ViTForImageClassification, ViTImageProcessor  # Pretrained ViT model and processor
+from transformers import TrainingArguments, Trainer  # Training utility classes
+
 
 print("All necessary libraries imported.")
 
