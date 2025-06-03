@@ -30,8 +30,8 @@ This project fine-tunes a pre-trained Vision Transformer (ViT) model to classify
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/yourusername/chest-xray-vit.git
-cd chest-xray-vit
+git clone https://github.com/Sam1rShaban1/Chest-X-Ray-ViT.git
+cd Chest-X-Ray-ViT
 ```
 
 ### 2. Create a virtual environment
@@ -87,7 +87,7 @@ python ViT-Training.py \
 
 ### Optional Flags
 
-- `--image_size`: Resize input image (default: 224)
+- `--image_size`: Resize input image (default: 384)
 - `--precision`: Enable mixed precision (default: False)
 - `--tpu`: Enable TPU training (default: True)
 
