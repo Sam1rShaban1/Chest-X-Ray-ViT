@@ -1,7 +1,7 @@
-# Core PyTorch and XLA libraries (install with the -f flag)
-torch~=2.5.0
-torchvision~=0.19.0
-torch_xla[tpu]~=2.5.0
+# Core PyTorch and XLA libraries
+torch==2.0.1
+torchvision==0.15.0
+torch_xla[tpu]==2.0.0
 
 # Other core deep learning libraries
 transformers
