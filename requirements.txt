@@ -7,8 +7,8 @@
 transformers
 accelerate
 bitsandbytes
-tensorflow-cpu
-tf-keras
+#tensorflow-cpu
+#tf-keras
 cloud-tpu-client
 
 # Data handling and utility libraries
