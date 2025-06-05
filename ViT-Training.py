@@ -61,14 +61,14 @@ BATCH_SIZE_PER_CORE = 16
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
-NUM_WORKERS = 8 # Number of CPU workers for data loading per DataLoader
+NUM_WORKERS = 64 # Number of CPU workers for data loading per DataLoader
 
 # For faster development, use a subset of data
-USE_SUBSET_DATA = None # Set to an integer (e.g., 1000) for fast testing, None for full dataset
+USE_SUBSET_DATA = 5000 # Set to an integer (e.g., 1000) for fast testing, None for full dataset
 
 # TPU Configuration (from Cell 2 in previous Colab structure)
-TPU_NAME = "my-vit-tpu" # MUST match the name you used in `gcloud compute tpus tpu-vm create`
-TPU_ZONE = "us-central1-b" # MUST match the zone you used (e.g., 'us-central1-b')
+TPU_NAME = "vit-training" # MUST match the name you used in `gcloud compute tpus tpu-vm create`
+TPU_ZONE = "europe-west4-a" # MUST match the zone you used (e.g., 'us-central1-b')
 
 print("Configuration set.")
 
