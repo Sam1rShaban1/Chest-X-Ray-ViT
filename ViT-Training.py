@@ -26,7 +26,6 @@ import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.distributed.parallel_loader as pl
-import tensorflow as tf # Used for TPUClusterResolver for external TPU connection
 
 print("All necessary libraries imported.")
 
@@ -74,14 +73,8 @@ print("Configuration set.")
 
 
 # --- Connect to TPU Device ---
-# This block replaces the simpler `device = xm.xla_device()`
 try:
-    print(f"Connecting to TPU: {TPU_NAME} in zone {TPU_ZONE}...")
-    tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=TPU_NAME, zone=TPU_ZONE, project=GCP_PROJECT_ID)
-    tf.config.experimental_connect_to_cluster(tpu_resolver)
-    tf.tpu.experimental.initialize_tpu_system(tpu_resolver)
-    print("TPU system initialized successfully.")
-
+    
     # Get XLA device for the current process
     device = xm.xla_device()
     # If running in multi-core context, each process gets its own device.
