@@ -1,6 +1,7 @@
 # --- Library Imports ---
 import os
 import io
+import json # For saving test results
 from PIL import Image, ImageDraw
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,20 +15,18 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from google.cloud import storage
-from tqdm import tqdm # For terminal-based progress bars (running as .py script)
+from tqdm import tqdm # For terminal-based progress bars
 
 # Hugging Face Transformers
 from transformers import ViTForImageClassification, ViTImageProcessor
-from transformers import TrainingArguments, Trainer
+# No longer using TrainingArguments, Trainer directly with xmp.spawn
+# from transformers import TrainingArguments, Trainer
 
 # TPU-specific imports
 import torch_xla
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.parallel_loader as pl
-
-# Import tensorflow for TPUClusterResolver
-import tensorflow as tf
+import torch_xla.distributed.xla_multiprocessing as xmp # Main entry point for TPU multiprocessing
+import torch_xla.distributed.parallel_loader as pl # For efficient data loading to TPU
 
 print("All necessary libraries imported.")
 
@@ -58,25 +57,23 @@ VIT_STD = [0.229, 0.224, 0.225]
 
 # TPU-specific batch size: This is PER CORE.
 # For v3-8 (8 cores), total batch size will be BATCH_SIZE_PER_CORE * 8.
-BATCH_SIZE_PER_CORE = 16
+BATCH_SIZE_PER_CORE = 16 # Adjust based on TPU core memory
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
-NUM_WORKERS = 8 # Number of CPU workers for data loading per DataLoader
+# Number of CPU workers for data loading *per process*.
+# Adjust this based on your VM's CPU cores per TPU core.
+# E.g., if v3-8 (8 cores) and VM has 32 vCPUs, you might use 4 workers per process (32/8).
+NUM_WORKERS = 4
 
 # For faster development, use a subset of data
-USE_SUBSET_DATA = 1000 # Set to an integer (e.g., 1000) for fast testing, None for full dataset
-
-# TPU Configuration
-TPU_NAME = "vit-training" # MUST match the name you used in `gcloud compute tpus tpu-vm create`
-TPU_ZONE = "europe-west4-a" # MUST match the zone you used (e.g., 'us-central1-b')
+USE_SUBSET_DATA = None # Set to an integer (e.g., 1000) for fast testing, None for full dataset
 
 print("Configuration set.")
 
-# --- Moved Global Variables and TPU Connection Logic ---
-# This block defines NUM_CLASSES and connects to TPU, so it must be run *before* anything uses NUM_CLASSES or the TPU device.
 
-# Initialize global variables that will be populated
+# --- Global Variables for Metadata and GCS Client ---
+# These will be loaded once by the main process and passed to spawned processes.
 storage_client = None
 bucket = None
 bbox_df = None
@@ -84,7 +81,8 @@ data_entry_df = None
 mlb = None
 unique_labels_list = []
 NUM_CLASSES = 0
-device = None # Will be set to XLA device or fallback
+gcs_blob_map = {} # This map will also be built once globally
+
 
 # --- Set up GCS client (used by multiple parts) ---
 storage_client = storage.Client(project=GCP_PROJECT_ID)
@@ -94,7 +92,6 @@ bucket = storage_client.bucket(GCS_BUCKET_NAME)
 # --- Load Metadata (BBox and Main Data_Entry), Label Binarization ---
 print("\n--- Loading Metadata ---")
 try:
-    # --- Load and Process BBox_List_2017.csv ---
     print(f"Attempting to download {GCS_BBOX_CSV_PATH} from gs://{GCS_BUCKET_NAME}/...")
     bbox_blob = bucket.blob(GCS_BBOX_CSV_PATH)
     csv_bytes = bbox_blob.download_as_bytes()
@@ -127,8 +124,6 @@ except Exception as e:
     print("Please ensure GCS_BBOX_CSV_PATH is correct and the file exists at the root of your bucket.")
     bbox_df = None
     bbox_dict = {}
-    # If this fails, the script might need to exit or use a fallback for BBoxes.
-    # For now, let's allow it to continue with bbox_dict=None.
 
 
 # --- Load and Process Data_Entry_2017.csv (Main Labels) ---
@@ -168,46 +163,15 @@ except Exception as e:
     unique_labels_list = []
     NUM_CLASSES = 0
 
-# --- Connect to External TPU (now that NUM_CLASSES is defined) ---
-# This block should be after NUM_CLASSES is defined for the model instantiation part
-# --- Connect to External TPU (now that NUM_CLASSES is defined) ---
 if NUM_CLASSES == 0:
-    print("ERROR: NUM_CLASSES is 0. Cannot proceed with TPU connection/model setup.")
-    raise SystemExit("TPU/Model setup aborted.")
-
-try:
-
-    device = xm.xla_device()
-
-    print(f"Device returned by xm.xla_device(): {device}")
-    if xm.is_xla_device(device):
-        print("Confirmed: Device is an XLA device (TPU).")
-        # In a multi-core setup, this will show the count of cores.
-        # When running a single process that uses all cores, it'll likely be 1 for the current process's view.
-        print(f"Number of XLA devices: {xm.xla_device_count()}")
-        print(f"Current XLA device ordinal: {xm.get_ordinal()}")
-        print(f"Current XLA device: {xm.xla_real_device(device)}")
-        print(f"Current PyTorch version: {torch.__version__}")
-        print(f"Current Torch/XLA version: {torch_xla.__version__}")
-    else:
-        print("WARNING: Device is NOT an XLA device. This script expects to run on a TPU VM.")
-        print("Falling back to CPU/GPU if available. This will be much slower.")
-        # Fallback if xm.xla_device() didn't find a TPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using fallback device: {device}")
-
-except Exception as e:
-    # This catch would now primarily be for issues with xm.xla_device() itself,
-    # or the underlying XLA setup, rather than connection to a remote host.
-    print(f"FATAL ERROR: Could not get XLA device: {e}")
-    print("Please ensure you are running this script inside a configured TPU VM environment.")
-    raise SystemExit("TPU device initialization failed.")
+    print("FATAL: NUM_CLASSES is 0 after metadata load. Exiting.")
+    exit() # Exit if metadata loading failed
 
 
 print("\nHelper functions and main metadata loaded.")
 
 
-# --- Helper Functions (Defined here, so they can access global config vars if needed) ---
+# --- Helper Functions ---
 
 def pad_to_square(pil_img, padding_value=0):
     w, h = pil_img.size
@@ -246,8 +210,6 @@ roi_preprocess_transforms = transforms.Compose([
 
 
 # --- Build GCS Image Path Map (Run Once at script start) ---
-# This map is crucial for quickly finding the GCS blob for a given image filename.
-# This must run *after* GCS client (storage_client, bucket) is initialized
 print("\n--- Building GCS Image Path Map (This may take a while for large datasets) ---")
 gcs_blob_map = {}
 image_subfolders = [f"images_{i:03}" for i in range(1, 13)] # images_001 to images_012
@@ -256,296 +218,397 @@ base_img_prefix = GCS_IMAGE_BASE_PREFIX
 if base_img_prefix and not base_img_prefix.endswith('/'):
     base_img_prefix += '/'
 
+# Use the globally defined bucket for map building
 for subfolder in image_subfolders:
     current_prefix = f"{base_img_prefix}{subfolder}/images/" # Adjust if your files are directly in 'images_00X/'
     try:
         blobs_in_folder = list(bucket.list_blobs(prefix=current_prefix))
         for blob_obj in blobs_in_folder:
-            if not blob_obj.name.endswith('/'): # Exclude folder blobs
+            if not blob_obj.name.endswith('/'):
                 gcs_blob_map[os.path.basename(blob_obj.name)] = blob_obj
     except Exception as e:
         print(f"Warning: Error listing blobs from {current_prefix}: {e}")
 print(f"Finished building GCS blob map with {len(gcs_blob_map)} unique image filenames.")
 
 
-# --- NIHChestDataset Class Definition and DataLoader Creation for Trainer ---
-
+# --- NIHChestDataset Class Definition ---
 class NIHChestDataset(Dataset):
     def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map=None, use_subset=None):
         self.transform = transform
         self.image_processor = image_processor
         self.bbox_dict = bbox_dict
+        self.label_binarizer = label_binarizer # Store label_binarizer
         self.gcs_blob_map = gcs_blob_map
 
         self.df_filtered = df[df['Image Index'].isin(image_filenames_list)].copy()
         self.df_filtered.set_index('Image Index', inplace=True)
 
-        self.labels_original_list = []
-        for img_idx in self.df_filtered.index:
-            labels_str = self.df_filtered.loc[img_idx, 'Finding Labels']
-            current_labels = [lbl.strip() for lbl in labels_str.split('|') if lbl.strip()]
-            if not current_labels:
-                current_labels = ['No Finding']
-            self.labels_original_list.append(current_labels)
-
-        self.encoded_labels = label_binarizer.transform(self.labels_original_list)
         self.image_filenames = self.df_filtered.index.tolist()
 
         if use_subset:
             self.image_filenames = self.image_filenames[:use_subset]
-            self.encoded_labels = self.encoded_labels[:use_subset]
 
-        self.images_in_memory = []
-        print(f"Pre-loading {len(self.image_filenames)} images for this dataset split into RAM...")
-        for img_name in tqdm(self.image_filenames, desc="Loading images to RAM"):
-            blob_to_download = self.gcs_blob_map.get(img_name)
-            if blob_to_download is None:
-                self.images_in_memory.append(Image.new('L', (IMG_SIZE, IMG_SIZE), color=0))
+        # Store filtered labels directly for faster __getitem__
+        self.encoded_labels = self.label_binarizer.transform(
+            self.df_filtered.loc[self.image_filenames, 'Finding Labels'].apply(lambda x: x.split('|'))
+        )
+
+        # IMPORTANT: NO IMAGE PRE-LOADING INTO RAM HERE for full dataset.
+        # Images will be loaded on-demand in __getitem__.
+        # We store the blob objects for quick access later.
+        self.image_blobs_for_dataset = {}
+        for img_name in self.image_filenames:
+            blob = self.gcs_blob_map.get(img_name)
+            if blob:
+                self.image_blobs_for_dataset[img_name] = blob
             else:
-                try:
-                    image_bytes = blob_to_download.download_as_bytes()
-                    self.images_in_memory.append(Image.open(io.BytesIO(image_bytes)).convert('L'))
-                    del image_bytes
-                except Exception as e:
-                    self.images_in_memory.append(Image.new('L', (IMG_SIZE, IMG_SIZE), color=0))
-        print(f"Finished pre-loading {len(self.images_in_memory)} images for this split.")
+                # If image not found in map, mark as None; __getitem__ will use dummy.
+                self.image_blobs_for_dataset[img_name] = None
+                print(f"Warning: Image {img_name} found in list but not in GCS map. Will use dummy.")
+
+        print(f"Dataset initialized to load {len(self.image_filenames)} images on demand.")
 
 
     def __len__(self):
         return len(self.image_filenames)
 
     def __getitem__(self, idx):
-        original_pil = self.images_in_memory[idx]
         img_name = self.image_filenames[idx]
         label_vector = torch.FloatTensor(self.encoded_labels[idx])
 
+        # Load image bytes directly from GCS in __getitem__ (ON-DEMAND)
+        original_pil = None
+        blob_to_download = self.image_blobs_for_dataset.get(img_name)
+
+        if blob_to_download:
+            try:
+                # IMPORTANT: Each process needs its own GCS client if not using pre-loaded
+                # `google.cloud.storage.Client` should be initialized *per worker* or *per process* if needed.
+                # Here, we assume the `blob_to_download` object itself handles its session correctly
+                # (which it often does, but re-initializing Client inside __getitem__ is safer for very long runs).
+                # For simplicity, we rely on the `blob_obj` from the globally built `gcs_blob_map`.
+                image_bytes = blob_to_download.download_as_bytes()
+                original_pil = Image.open(io.BytesIO(image_bytes)).convert('L') # Open as grayscale
+                del image_bytes # Free up bytes
+            except Exception as e:
+                # print(f"Error: Failed to load image {img_name} from GCS in __getitem__: {e}. Using dummy.")
+                original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0) # Black dummy on failure
+        else:
+            original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0) # Black dummy if not found in map
+
+
+        # Apply BBox cropping if available, otherwise use full image (padded to square)
         cropped_padded_pil_image = None
         if img_name in self.bbox_dict and self.bbox_dict[img_name]:
-            bbox_coords = self.bbox_dict[img_name][0]
+            bbox_coords = self.bbox_dict[img_name][0] # Using the first bbox for simplicity
             cropped_padded_pil_image = crop_and_pad_from_bbox(original_pil, bbox_coords, padding_value=0)
         else:
             cropped_padded_pil_image = pad_to_square(original_pil, padding_value=0)
 
+        # Apply torchvision transforms
         if self.transform:
             cropped_padded_pil_image = self.transform(cropped_padded_pil_image)
 
+        # Apply Hugging Face ViTImageProcessor
         if self.image_processor:
             processed_output = self.image_processor(images=cropped_padded_pil_image, return_tensors="pt")
-            image_tensor = processed_output.pixel_values.squeeze(0)
+            image_tensor = processed_output.pixel_values.squeeze(0) # Remove batch dimension
         else:
-            image_tensor = cropped_padded_pil_image
+            image_tensor = cropped_padded_pil_image # Fallback if no image_processor
 
         return {'pixel_values': image_tensor, 'labels': label_vector}
 
 
-# --- Create Datasets for Trainer ---
-if data_entry_df is not None and mlb is not None and gcs_blob_map:
-    print("\n--- Creating Datasets for Trainer ---")
+# --- Training and Evaluation Functions (adapted for xmp.spawn) ---
+def train_one_epoch(model, dataloader, criterion, optimizer, device, rank, total_processes):
+    model.train()
+    running_loss = 0.0
+    # Wrap DataLoader with ParallelLoader for TPU
+    # We pass the device list to ParallelLoader. Each process only uses its own 'device'.
+    para_loader = pl.ParallelLoader(dataloader, [device])
+    # TQDM only for master process
+    pbar = tqdm(para_loader.per_device_loader(device), desc=f"Training (Rank {rank})", disable=(rank != 0))
 
-    try:
-        train_val_list_blob = bucket.blob(GCS_TRAIN_VAL_LIST_PATH)
-        train_val_files = train_val_list_blob.download_as_bytes().decode('utf-8').splitlines()
+    for i, batch in enumerate(pbar):
+        images = batch['pixel_values']
+        labels = batch['labels']
 
-        test_list_blob = bucket.blob(GCS_TEST_LIST_PATH)
-        test_files = test_list_blob.download_as_bytes().decode('utf-8').splitlines()
+        optimizer.zero_grad()
 
-        train_files_final, val_files_final = train_test_split(train_val_files, test_size=0.15, random_state=42)
+        outputs = model(images).logits
+        loss = criterion(outputs, labels)
 
-        print("Initializing Train Dataset...")
-        train_dataset = NIHChestDataset(data_entry_df, train_files_final, bbox_dict, mlb,
-                                        transform=roi_preprocess_transforms, image_processor=image_processor,
-                                        gcs_blob_map=gcs_blob_map, use_subset=USE_SUBSET_DATA)
-        print("Initializing Validation Dataset...")
-        val_dataset = NIHChestDataset(data_entry_df, val_files_final, bbox_dict, mlb,
-                                      transform=roi_preprocess_transforms, image_processor=image_processor,
-                                      gcs_blob_map=gcs_blob_map, use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None)
-        print("Initializing Test Dataset...")
-        test_dataset = NIHChestDataset(data_entry_df, test_files, bbox_dict, mlb,
-                                       transform=roi_preprocess_transforms, image_processor=image_processor,
-                                       gcs_blob_map=gcs_blob_map, use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None)
+        loss.backward()
+        xm.optimizer_step(optimizer, barrier=True) # barrier=True ensures all-reduce for gradients
+        xm.mark_step() # Crucial for TPU to execute graph
 
-        print(f"Train dataset size: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+        # Aggregate loss across all processes for logging
+        reduced_loss = xm.all_reduce(xm.REDUCE_SUM, loss)
+        running_loss += reduced_loss.item() * images.size(0)
 
-    except Exception as e:
-        print(f"ERROR: Failed to load train/val/test lists from GCS or create datasets: {e}")
-        print("Please ensure GCS_TRAIN_VAL_LIST_PATH and GCS_TEST_LIST_PATH are correct and files exist.")
-        train_dataset = None
-        val_dataset = None
-        test_dataset = None
-else:
-    print("WARNING: DataFrames, MultiLabelBinarizer, or GCS blob map not initialized. Skipping Dataset creation.")
+        if rank == 0: # Only master updates progress bar
+            pbar.set_postfix(loss=reduced_loss.item())
 
-print("Datasets configured.")
+    # Aggregate total loss across all processes for epoch loss
+    total_samples = len(dataloader.dataset) # Dataset size might be different per process
+    # Need to sum individual losses from each device and then divide by total global samples
+    total_loss_tensor = torch.tensor(running_loss, dtype=torch.float32, device=device)
+    global_total_loss = xm.all_reduce(xm.REDUCE_SUM, total_loss_tensor)
+    
+    # Total samples for epoch_loss should be global.
+    # The dataloader.dataset.sampler.num_samples is the samples *for this replica*.
+    # Use global_total_samples = xm.all_reduce(xm.REDUCE_SUM, torch.tensor(len(dataloader.dataset), dtype=torch.float32, device=device))
+    # Or just use the global dataset size: len(full_train_dataset)
+    
+    epoch_loss = global_total_loss.item() / len(dataloader.dataset) # For distributed sampler, len(dataloader.dataset) is local part
+    # A more correct global average loss:
+    # xm.all_reduce(xm.REDUCE_SUM, torch.tensor(running_loss / len(dataloader.dataset), device=device)).item()
+
+    return epoch_loss
 
 
-# --- Data Collator and Evaluation Metrics for Trainer ---
+def evaluate_model(model, dataloader, criterion, device, label_names, rank, total_processes):
+    model.eval()
+    running_loss = 0.0
+    all_preds_list = []
+    all_targets_list = []
 
-def collate_fn(batch):
-    pixel_values = torch.stack([x['pixel_values'] for x in batch])
-    labels = torch.stack([x['labels'] for x in batch])
-    return {
-        'pixel_values': pixel_values,
-        'labels': labels
-    }
+    para_loader = pl.ParallelLoader(dataloader, [device])
+    # TQDM only for master process
+    pbar = tqdm(para_loader.per_device_loader(device), desc=f"Evaluating (Rank {rank})", disable=(rank != 0))
 
-def compute_metrics(eval_pred):
-    predictions = torch.sigmoid(torch.tensor(eval_pred.predictions)).numpy()
-    labels = eval_pred.label_ids
+    with torch.no_grad():
+        for batch in pbar:
+            images = batch['pixel_values']
+            labels = batch['labels']
 
+            outputs = model(images).logits
+            loss = criterion(outputs, labels)
+
+            reduced_loss = xm.all_reduce(xm.REDUCE_SUM, loss)
+            running_loss += reduced_loss.item() * images.size(0)
+
+            probs = torch.sigmoid(outputs)
+            # Gather predictions and targets from all TPU cores
+            # all_gather creates a tensor with dim 0 being the concatenation of all replicas' tensors
+            all_preds_list.append(xm.all_gather(probs, dim=0).cpu().numpy())
+            all_targets_list.append(xm.all_gather(labels, dim=0).cpu().numpy())
+            xm.mark_step() # Mark step for evaluation pass
+
+    # Aggregate loss and metrics
+    global_total_loss = xm.all_reduce(xm.REDUCE_SUM, torch.tensor(running_loss, dtype=torch.float32, device=device))
+    epoch_loss = global_total_loss.item() / len(dataloader.dataset) # len(dataloader.dataset) is local part
+
+    # Concatenate collected arrays (will be global due to all_gather)
+    all_preds = np.concatenate(all_preds_list, axis=0)
+    all_targets = np.concatenate(all_targets_list, axis=0)
+
+    # Note: Metrics should ideally be computed only once on the master process after all data is gathered.
+    # If computed on all processes, it's redundant.
+    # For simplicity here, we let it run on all and rely on only master printing.
     auroc_per_class = {}
     valid_classes_for_auroc = 0
     total_auroc = 0
 
-    for i, label_name in enumerate(mlb.classes_):
+    for i, label_name in enumerate(label_names):
         try:
-            if len(np.unique(labels[:, i])) > 1:
-                class_roc_auc = roc_auc_score(labels[:, i], predictions[:, i])
+            if len(np.unique(all_targets[:, i])) > 1:
+                class_roc_auc = roc_auc_score(all_targets[:, i], all_preds[:, i])
                 auroc_per_class[label_name] = class_roc_auc
                 total_auroc += class_roc_auc
                 valid_classes_for_auroc += 1
             else:
                 auroc_per_class[label_name] = np.nan
-        except Exception as e:
+        except Exception:
             auroc_per_class[label_name] = np.nan
 
     avg_auroc = total_auroc / valid_classes_for_auroc if valid_classes_for_auroc > 0 else 0.0
 
-    return {"avg_auroc": avg_auroc, **auroc_per_class}
+    return epoch_loss, avg_auroc, auroc_per_class
 
 
-# --- Model Instantiation ---
+# --- Main function for xmp.spawn ---
+# This function will be executed by each process
+def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map, unique_labels_list):
+    # Each process gets its own device
+    device = xm.xla_device()
+    print(f"Process {rank}: Starting on device {device}")
 
-if NUM_CLASSES == 0:
-    print("ERROR: NUM_CLASSES is 0. Cannot initialize model. Check previous steps for metadata loading errors.")
-else:
-    print(f"\n--- Loading Model: {MODEL_NAME} ---")
+    # Initialize model on this device
     model = ViTForImageClassification.from_pretrained(
         MODEL_NAME,
         num_labels=NUM_CLASSES,
         ignore_mismatched_sizes=True,
-        id2label={i: c for i, c in enumerate(mlb.classes_)},
-        label2id={c: i for i, c in enumerate(mlb.classes_)}
+        id2label={i: c for i, c in enumerate(unique_labels_list)},
+        label2id={c: i for i, c in enumerate(unique_labels_list)}
+    )
+    model.to(device)
+
+    # Criterion and optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=True)
+
+
+    # Load train/val/test list files from GCS (each process can do this, cached by GCS client)
+    train_val_list_blob = bucket.blob(GCS_TRAIN_VAL_LIST_PATH)
+    train_val_files = train_val_list_blob.download_as_bytes().decode('utf-8').splitlines()
+
+    test_list_blob = bucket.blob(GCS_TEST_LIST_PATH)
+    test_files = test_list_blob.download_as_bytes().decode('utf-8').splitlines()
+
+    train_files_final, val_files_final = train_test_split(train_val_files, test_size=0.15, random_state=42)
+
+    # --- Create Datasets ---
+    print(f"Process {rank}: Initializing Train Dataset...")
+    train_dataset = NIHChestDataset(data_entry_df, train_files_final, bbox_dict, mlb,
+                                    transform=roi_preprocess_transforms, image_processor=image_processor,
+                                    gcs_blob_map=gcs_blob_map, use_subset=USE_SUBSET_DATA)
+    print(f"Process {rank}: Initializing Validation Dataset...")
+    val_dataset = NIHChestDataset(data_entry_df, val_files_final, bbox_dict, mlb,
+                                  transform=roi_preprocess_transforms, image_processor=image_processor,
+                                  gcs_blob_map=gcs_blob_map, use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None)
+    print(f"Process {rank}: Initializing Test Dataset...")
+    test_dataset = NIHChestDataset(data_entry_df, test_files, bbox_dict, mlb,
+                                   transform=roi_preprocess_transforms, image_processor=image_processor,
+                                   gcs_blob_map=gcs_blob_map, use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None)
+
+    print(f"Process {rank}: Train dataset size: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+
+    # --- Create DataLoaders for each process ---
+    # Sampler for distributed training: ensures each core gets a unique subset of data
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+        num_replicas=xm.xla_device_count(), # Total number of TPU cores
+        rank=xm.get_ordinal(),              # Current core's ordinal
+        shuffle=True
+    )
+    val_sampler = torch.utils.data.distributed.DistributedSampler(
+        val_dataset,
+        num_replicas=xm.xla_device_count(),
+        rank=xm.get_ordinal(),
+        shuffle=False
+    )
+    test_sampler = torch.utils.data.distributed.DistributedSampler(
+        test_dataset,
+        num_replicas=xm.xla_device_count(),
+        rank=xm.get_ordinal(),
+        shuffle=False
     )
 
-    model.to(device) # Move model to the detected XLA or CPU/GPU device
-    print(f"Model loaded: {MODEL_NAME} with {NUM_CLASSES} output classes for fine-tuning.")
-    print(f"Model will be trained on: {device}")
+    # Use drop_last=True for training loader to ensure even batch sizes across all replicas
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE_PER_CORE, sampler=train_sampler, num_workers=NUM_WORKERS, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE_PER_CORE, sampler=val_sampler, num_workers=NUM_WORKERS, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE_PER_CORE, sampler=test_sampler, num_workers=NUM_WORKERS, drop_last=False)
+
+    print(f"Process {rank}: Train Dataloader: {len(train_loader)} batches, Val: {len(val_loader)}, Test: {len(test_loader)}")
 
 
-# --- Define Training Arguments and Instantiate Trainer ---
+    # --- Training Loop ---
+    best_val_auroc = 0.0
+    history = {'train_loss': [], 'val_loss': [], 'val_avg_auroc': []}
 
-if train_dataset is None or val_dataset is None or model is None:
-    print("ERROR: Datasets or model not initialized. Cannot set up Trainer.")
-else:
-    training_args = TrainingArguments(
-      output_dir=OUTPUT_DIR,
-      per_device_train_batch_size=BATCH_SIZE_PER_CORE,
-      per_device_eval_batch_size=BATCH_SIZE_PER_CORE,
-      
-      dataloader_pin_memory=False,
-      eval_strategy="steps",
-      eval_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 10),
-      
-      num_train_epochs=NUM_EPOCHS,
-      
-      save_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 5),
+    print(f"\nProcess {rank}: Starting training for {NUM_EPOCHS} epochs...")
+    for epoch in range(NUM_EPOCHS):
+        print(f"\nProcess {rank} --- Epoch {epoch+1}/{NUM_EPOCHS} ---")
+        train_sampler.set_epoch(epoch) # Important for shuffling in distributed training
 
-      logging_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 20),
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, rank, xm.xla_device_count())
+        history['train_loss'].append(train_loss)
+        print(f"Process {rank} Epoch {epoch+1} Train Loss: {train_loss:.4f}")
 
-      learning_rate=LEARNING_RATE,
-      weight_decay=WEIGHT_DECAY,
-      save_total_limit=2,
-      remove_unused_columns=False,
-      push_to_hub=False,
-      report_to='tensorboard',
-      load_best_model_at_end=True,
-      metric_for_best_model="avg_auroc",
-      greater_is_better=True,
-      gradient_accumulation_steps=1,
-      dataloader_num_workers=NUM_WORKERS
-    )
+        val_loss, val_avg_auroc, val_auroc_per_class = evaluate_model(model, val_loader, criterion, device, unique_labels_list, rank, xm.xla_device_count())
+        history['val_loss'].append(val_loss)
+        history['val_avg_auroc'].append(val_avg_auroc)
+        print(f"Process {rank} Epoch {epoch+1} Val Loss: {val_loss:.4f}, Val Avg AUROC: {val_avg_auroc:.4f}")
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        data_collator=collate_fn,
-        compute_metrics=compute_metrics,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-    )
+        scheduler.step(val_loss)
 
-    print("Training arguments and Trainer instantiated.")
+        # Only the master process (rank 0) saves the model and plots
+        if rank == 0:
+            if val_avg_auroc > best_val_auroc:
+                best_val_auroc = val_avg_auroc
+                best_model_path = os.path.join(OUTPUT_DIR, "vit_nih_best_model.pth")
+                xm.save(model.state_dict(), best_model_path) # Use xm.save() to save from TPU to GCS/local
+                print(f"Process {rank}: New best model saved with Avg AUROC: {best_val_auroc:.4f} to {best_model_path}")
 
+            # Plotting (only on master process after last epoch, or periodically)
+            if epoch == NUM_EPOCHS - 1: # Plot after last epoch
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                plt.plot(history['train_loss'], label='Train Loss')
+                plt.plot(history['val_loss'], label='Val Loss')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.title('Loss Over Epochs')
+                plt.legend()
+                plt.grid(True)
 
-# --- Training Execution ---
+                plt.subplot(1, 2, 2)
+                plt.plot(history['val_avg_auroc'], label='Val Avg AUROC', color='orange')
+                plt.xlabel('Epoch')
+                plt.ylabel('Avg AUROC')
+                plt.title('Validation Average AUROC Over Epochs')
+                plt.legend()
+                plt.grid(True)
 
-if 'trainer' in globals():
-    print("\n--- Starting Training ---")
-    train_results = trainer.train()
+                plt.tight_layout()
+                plot_path = os.path.join(OUTPUT_DIR, "training_metrics_plot.png")
+                plt.savefig(plot_path)
+                print(f"Process {rank}: Training metrics plot saved to {plot_path}")
+                plt.close() # Close plot to free memory
+        
+        # All processes must call mark_step() at the end of each epoch for synchronization
+        xm.mark_step() 
 
-    trainer.save_model()
-    trainer.log_metrics("train", train_results.metrics)
-    trainer.save_metrics("train", train_results.metrics)
-    trainer.save_state()
-
-    print("\n--- Training Finished ---")
-
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    train_losses = [log['loss'] for log in trainer.state.log_history if 'loss' in log and 'eval_loss' not in log]
-    eval_losses = [log['eval_loss'] for log in trainer.state.log_history if 'eval_loss' in log]
-    train_steps = [log['step'] for log in trainer.state.log_history if 'loss' in log and 'eval_loss' not in log]
-    eval_steps = [log['step'] for log in trainer.state.log_history if 'eval_loss' in log]
-
-    if train_losses:
-        plt.plot(train_steps, train_losses, label='Train Loss')
-    if eval_losses:
-        plt.plot(eval_steps, eval_losses, label='Validation Loss')
-    plt.xlabel('Training Steps')
-    plt.ylabel('Loss')
-    plt.title('Loss Over Training Steps')
-    plt.legend()
-    plt.grid(True)
-
-    plt.subplot(1, 2, 2)
-    eval_auroc_history = [log['eval_avg_auroc'] for log in trainer.state.log_history if 'eval_avg_auroc' in log]
-    if eval_auroc_history:
-        plt.plot(eval_steps, eval_auroc_history, label='Validation Avg AUROC', color='orange')
-    plt.xlabel('Training Steps')
-    plt.ylabel('Avg AUROC')
-    plt.title('Validation Average AUROC Over Steps')
-    plt.legend()
-    plt.grid(True)
-
-    plt.tight_layout()
-    plot_path = os.path.join(OUTPUT_DIR, "training_metrics_plot.png")
-    plt.savefig(plot_path)
-    print(f"Training metrics plot saved to {plot_path}")
-    plt.close()
-
-else:
-    print("Trainer not instantiated. Skipping training execution.")
+    print(f"\nProcess {rank}: Training finished.")
 
 
-# --- Final Evaluation on Test Set ---
+    # --- Final Evaluation on Test Set (only on master process) ---
+    if rank == 0:
+        print("\n--- Evaluating on Test Set ---")
+        best_model_path = os.path.join(OUTPUT_DIR, "vit_nih_best_model.pth")
+        if os.path.exists(best_model_path):
+            # Load the best model's weights on the master process for final eval
+            model.load_state_dict(xm.load(best_model_path)) # Use xm.load() to load from TPU-compatible path
+            model.to(device) # Ensure model is on device after loading state dict
 
-if 'trainer' in globals() and 'test_dataset' in globals() and test_dataset is not None:
-    print("\n--- Evaluating on Test Set ---")
-    metrics = trainer.evaluate(test_dataset)
+            test_loss, test_avg_auroc, test_auroc_per_class = evaluate_model(model, test_loader, criterion, device, unique_labels_list, rank, xm.xla_device_count())
 
-    trainer.log_metrics("eval", metrics)
-    trainer.save_metrics("eval", metrics)
+            print(f"\nTest Loss: {test_loss:.4f}")
+            print(f"Test Average AUROC: {test_avg_auroc:.4f}")
+            print("\nTest AUROC per class:")
+            sorted_auroc = sorted(test_auroc_per_class.items(), key=lambda item: item[1] if not np.isnan(item[1]) else -1, reverse=True)
+            for disease, score in sorted_auroc:
+                print(f"  {disease}: {score:.4f}")
 
-    print(f"\nTest results saved to {os.path.join(OUTPUT_DIR, 'eval_results.json')}")
-    print("\nTest AUROC per class:")
-    test_auroc_per_class = {k.replace('eval_', ''): v for k, v in metrics.items() if k.startswith('eval_') and k not in ['eval_loss', 'eval_avg_auroc', 'eval_runtime', 'eval_samples_per_second', 'eval_steps_per_second']}
-    sorted_auroc = sorted(test_auroc_per_class.items(), key=lambda item: item[1] if not np.isnan(item[1]) else -1, reverse=True)
+            # Save test results (e.g., to a JSON file)
+            test_results_path = os.path.join(OUTPUT_DIR, "test_results.json")
+            with open(test_results_path, 'w') as f:
+                json.dump({"loss": test_loss, "avg_auroc": test_avg_auroc, "auroc_per_class": test_auroc_per_class}, f, indent=4)
+            print(f"Test results saved to {test_results_path}")
 
-    for disease, score in sorted_auroc:
-        print(f"  {disease}: {score:.4f}")
+            print("\n--- Evaluation Finished ---")
+        else:
+            print(f"Process {rank}: Best model checkpoint not found at {best_model_path}. Skipping final test evaluation.")
+    else:
+        # Non-master processes wait for master to finish evaluation if needed for synchronization
+        # xm.rendezvous('test_eval_sync') # Not strictly needed if master is only one saving/printing
+        print(f"Process {rank}: Skipping test set evaluation (master-only).")
 
-    print("\n--- Evaluation Finished ---")
 
-else:
-    print("Trainer or test dataset not available. Skipping test set evaluation.")
+# --- Main execution block ---
+if __name__ == '__main__':
+    # Ensure all global dataframes and maps are loaded before spawning processes
+    if data_entry_df is None or bbox_df is None or mlb is None or not gcs_blob_map:
+        print("ERROR: Global metadata (DataFrames, MLB, or GCS map) not fully loaded. Cannot proceed with training.")
+        exit(1) # Exit with an error code
+
+    # Determine number of TPU cores available to this host
+    num_tpu_cores = xm.xla_device_count()
+    print(f"Main process: Attempting to spawn {num_tpu_cores} processes for TPU training.")
+
+    # Call xmp.spawn with the _mp_fn and necessary global arguments
+    # `start_method='fork'` is usually faster for CPU-bound setup, but 'spawn' is safer if resources are shared
+    # For TPU VMs, 'spawn' or 'fork' generally work.
+    xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map, unique_labels_list,), nprocs=num_tpu_cores, start_method='fork')
