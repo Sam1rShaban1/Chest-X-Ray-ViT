@@ -1,5 +1,6 @@
 # Core PyTorch and XLA libraries
- pip install --upgrade torch_xla torch torchvision -f https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla_releases.html
+# Run this in VM CLI
+#pip install --upgrade torch_xla torch torchvision -f https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla_releases.html
 
 # Other core deep learning libraries
 transformers
