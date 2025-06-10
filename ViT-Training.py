@@ -60,10 +60,10 @@ BATCH_SIZE_PER_CORE = 16
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
-NUM_WORKERS = 64 # Number of CPU workers for data loading per DataLoader
+NUM_WORKERS = 8 # Number of CPU workers for data loading per DataLoader x 8
 
 # For faster development, use a subset of data
-USE_SUBSET_DATA = 5000 # Set to an integer (e.g., 1000) for fast testing, None for full dataset
+USE_SUBSET_DATA = 1000 # Set to an integer (e.g., 1000) for fast testing, None for full dataset
 
 # TPU Configuration (from Cell 2 in previous Colab structure)
 TPU_NAME = "vit-training" # MUST match the name you used in `gcloud compute tpus tpu-vm create`
@@ -73,23 +73,45 @@ print("Configuration set.")
 
 
 # --- Connect to TPU Device ---
+
+if NUM_CLASSES == 0:
+    print("ERROR: NUM_CLASSES is 0. Cannot initialize model. Check previous cells for metadata loading errors.")
+    raise SystemExit("Model setup aborted.")
+
+# --- Connect to External TPU ---
 try:
-    
-    # Get XLA device for the current process
-    device = xm.xla_device()
-    # If running in multi-core context, each process gets its own device.
-    # xm.set_default_device(device) # Often set by XLA's multiprocessing utilities
-    print(f"Using XLA device: {device}")
+    print(f"Connecting to TPU: {TPU_NAME} in zone {TPU_ZONE}...")
+    tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=TPU_NAME, zone=TPU_ZONE, project=GCP_PROJECT_ID)
+    tf.config.experimental_connect_to_cluster(tpu_resolver)
+    tf.tpu.experimental.initialize_tpu_system(tpu_resolver)
+    print("TPU system initialized.")
+
+    # Get XLA device
+    device = xm.xla_device() # This should return a TPU device
+
+    # --- ADDED DIAGNOSTICS ---
+    print(f"Device returned by xm.xla_device(): {device}")
+    if xm.is_xla_device(device):
+        print("Confirmed: Device is an XLA device (TPU).")
+        print(f"Number of XLA devices: {xm.xla_device_count()}")
+        print(f"Current XLA device ordinal: {xm.get_ordinal()}")
+        print(f"Current XLA device: {xm.xla_real_device(device)}")
+        print(f"Current PyTorch version: {torch.__version__}")
+        print(f"Current TorchVision version: {torchvision.__version__}")
+        print(f"Current Torch/XLA version: {torch_xla.__version__}")
+    else:
+        print("WARNING: Device is NOT an XLA device. Fallback to CPU/GPU might have occurred, or connection failed silently.")
+    # --- END ADDED DIAGNOSTICS ---
 
 except Exception as e:
     print(f"ERROR: Could not connect to external TPU: {e}")
     print("Please ensure your TPU VM is running, its name/zone/project are correct, and IAM permissions are set.")
-    print("Falling back to CPU if no GPU available.")
+    print("Falling back to CPU/GPU if available.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using fallback device: {device}")
 
 
-# --- Load Metadata (BBox and Main Data_Entry), Label Binarization, and Helper Functions ---
+#Load Metadata (BBox and Main Data_Entry), Label Binarization, and Helper Functions ---
 
 storage_client = storage.Client(project=GCP_PROJECT_ID)
 bucket = storage_client.bucket(GCS_BUCKET_NAME)
@@ -440,9 +462,10 @@ else:
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE,
       
+      dataloader_pin_memory=False,
       # Evaluation strategy: 'steps' for regular evaluation (e.g., every eval_steps)
       # or 'epoch' for evaluation at the end of each epoch.
-      evaluation_strategy="steps", # Evaluate at specific steps
+      eval_strategy="steps", # Evaluate at specific steps
       eval_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 10), # Evaluate every 10% of an epoch for example
       # Adjust eval_steps to a reasonable number. If eval_steps < 1, it won't evaluate.
       # You might also set this to `len(train_loader)` to evaluate per epoch.
@@ -450,7 +473,8 @@ else:
       num_train_epochs=NUM_EPOCHS,
       
       # For TPUs, `fp16=True` internally translates to bfloat16.
-      fp16=True,
+      # fp16=False,
+      # bf16=True,
       
       save_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 5), # Save checkpoint every 20% of an epoch
       # Adjust save_steps similarly. If save_steps < 1, it won't save.
