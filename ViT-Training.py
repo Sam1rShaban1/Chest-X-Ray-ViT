@@ -1,7 +1,7 @@
 # --- Library Imports ---
 import os
 import io
-import json
+import json # For saving test results
 from PIL import Image, ImageDraw
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,8 +14,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from google.cloud import storage # Only import, do not initialize globally
-from tqdm import tqdm
+from google.cloud import storage # Only import, do not initialize globally for pickling safety
+from tqdm import tqdm # For terminal-based progress bars
 
 # Hugging Face Transformers
 from transformers import ViTForImageClassification, ViTImageProcessor
@@ -23,8 +23,8 @@ from transformers import ViTForImageClassification, ViTImageProcessor
 # TPU-specific imports
 import torch_xla
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp # Main entry point for TPU multiprocessing
+import torch_xla.distributed.parallel_loader as pl # For efficient data loading to TPU
 
 print("All necessary libraries imported.")
 
@@ -33,46 +33,60 @@ print("All necessary libraries imported.")
 GCP_PROJECT_ID = "affable-alpha-454813-t8"
 GCS_BUCKET_NAME = "chest-xray-samir"
 
-GCS_IMAGE_BASE_PREFIX = ""
+GCS_IMAGE_BASE_PREFIX = "" # Confirm this is correct for your bucket structure (e.g., "", "data/", or "chest_x-ray/nih_chest_xray/")
+
+# GCS Paths to your metadata files (assuming they are at the root of GCS_BUCKET_NAME)
 GCS_BBOX_CSV_PATH = "BBox_List_2017.csv"
 GCS_DATA_ENTRY_CSV_PATH = "Data_Entry_2017.csv"
 GCS_TRAIN_VAL_LIST_PATH = "train_val_list.txt"
 GCS_TEST_LIST_PATH = "test_list.txt"
 
+# --- Local Output Directory on the VM ---
+# This will still be used for local logging/plots but models go to GCS
 OUTPUT_DIR = os.path.expanduser("~/vit_finetune_results/")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
+# --- ViT Model & Training Hyperparameters ---
 MODEL_NAME = 'google/vit-base-patch16-384'
 IMG_SIZE = 384
+
 VIT_MEAN = [0.485, 0.456, 0.406]
 VIT_STD = [0.229, 0.224, 0.225]
 
+# TPU-specific batch size: This is PER CORE.
+# For v3-8 (8 cores), total batch size will be BATCH_SIZE_PER_CORE * 8.
 BATCH_SIZE_PER_CORE = 16
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
+# Number of CPU workers for data loading *per process*.
+# Adjust this based on your VM's CPU cores per TPU core.
+# E.g., if v3-8 (8 cores) and VM has 32 vCPUs, you might use 4 workers per process (32/8).
 NUM_WORKERS = 4
 
-USE_SUBSET_DATA = None
+# For faster development, use a subset of data
+USE_SUBSET_DATA = None # Set to an integer (e.g., 1000) for fast testing, None for full dataset
 
 print("Configuration set.")
 
 
 # --- Global Variables for Metadata (loaded by main process) ---
-# NO GCS CLIENTS HERE. ONLY DATA.
+# These are loaded by the main process and then passed to spawned processes.
+# NO GCS CLIENT OR BUCKET OBJECTS HERE. Only picklable data.
 bbox_df = None
 data_entry_df = None
 mlb = None
 unique_labels_list = []
 NUM_CLASSES = 0
-# gcs_blob_map will be built per process in _mp_fn
+gcs_blob_map_names = {} # This will store *string names* of blobs, NOT blob objects
 
 
 # --- Load Metadata (from main process) ---
-# This part is still run by the main process only, as dataframes are picklable.
+# This part is run by the main process only, as dataframes are picklable.
 print("\n--- Loading Metadata ---")
 try:
-    # Initialize a temporary client for metadata loading in the main process
+    # Initialize a temporary GCS client for metadata loading in the main process.
     # This client will NOT be passed to child processes.
     _temp_storage_client = storage.Client(project=GCP_PROJECT_ID)
     _temp_bucket = _temp_storage_client.bucket(GCS_BUCKET_NAME)
@@ -151,9 +165,10 @@ except Exception as e:
 
 if NUM_CLASSES == 0:
     print("FATAL: NUM_CLASSES is 0 after metadata load. Exiting.")
-    exit() # Exit if metadata loading failed
+    exit()
 
-# Delete temporary client in main process
+# Delete temporary client in main process after metadata loading is complete.
+# This prevents pickling issues.
 del _temp_storage_client
 del _temp_bucket
 
@@ -162,7 +177,7 @@ print("\nHelper functions and main metadata loaded.")
 
 
 # --- Helper Functions (remain global, can access global config vars) ---
-# These functions do not use GCS client objects, so they are fine here.
+# These functions do not use GCS client objects, so they are fine globally.
 def pad_to_square(pil_img, padding_value=0):
     w, h = pil_img.size
     if w == h:
@@ -191,12 +206,42 @@ def crop_and_pad_from_bbox(pil_img, bbox_coords, padding_value=0):
     cropped_pil = pil_img.crop((left, upper, right, lower))
     return pad_to_square(cropped_pil, padding_value)
 
+# Image processor for ViT
 image_processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
 
 roi_preprocess_transforms = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.Lambda(lambda img: img.convert('RGB')),
 ])
+
+
+# --- Build GCS Image Path Map (Run Once at script start, in main process) ---
+# This map will store *string names* of blobs, NOT blob objects.
+print("\n--- Building GCS Image Path Map (This may take a while for large datasets) ---")
+# Re-initialize a temporary client for map building in the main process
+_temp_storage_client_map = storage.Client(project=GCP_PROJECT_ID)
+_temp_bucket_map = _temp_storage_client_map.bucket(GCS_BUCKET_NAME)
+
+image_subfolders = [f"images_{i:03}" for i in range(1, 13)] # images_001 to images_012
+
+base_img_prefix = GCS_IMAGE_BASE_PREFIX
+if base_img_prefix and not base_img_prefix.endswith('/'):
+    base_img_prefix += '/'
+
+for subfolder in image_subfolders:
+    current_prefix = f"{base_img_prefix}{subfolder}/images/" # Adjust if your files are directly in 'images_00X/'
+    try:
+        blobs_in_folder = list(_temp_bucket_map.list_blobs(prefix=current_prefix))
+        for blob_obj in blobs_in_folder:
+            if not blob_obj.name.endswith('/'): # Exclude folder blobs
+                gcs_blob_map_names[os.path.basename(blob_obj.name)] = blob_obj.name # <--- Store STRING NAME
+    except Exception as e:
+        print(f"Warning: Error listing blobs from {current_prefix}: {e}")
+print(f"Finished building GCS blob map with {len(gcs_blob_map_names)} unique image filenames.")
+
+# Delete temporary client for map building. Prevents pickling issues.
+del _temp_storage_client_map
+del _temp_bucket_map
 
 
 # --- NIHChestDataset Class Definition (updated for GCS client per worker) ---
@@ -206,8 +251,8 @@ class NIHChestDataset(Dataset):
         self.image_processor = image_processor
         self.bbox_dict = bbox_dict
         self.label_binarizer = label_binarizer
-        # We now get the *names* of the blobs, and initialize client/bucket per worker.
-        self.gcs_blob_names_for_dataset = gcs_blob_map_names # This is a dict of filename -> blob_name (string)
+        # We now get the *names* of the blobs (strings), which are picklable.
+        self.gcs_blob_names_for_dataset = gcs_blob_map_names
 
         self.df_filtered = df[df['Image Index'].isin(image_filenames_list)].copy()
         self.df_filtered.set_index('Image Index', inplace=True)
@@ -235,21 +280,22 @@ class NIHChestDataset(Dataset):
         blob_name_to_download = self.gcs_blob_names_for_dataset.get(img_name)
 
         # Initialize GCS client per worker/getitem for robustness.
-        # This is CRITICAL for multiprocessing.
+        # This is CRITICAL for multiprocessing (as each worker/thread might access it).
         worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
         worker_bucket = worker_storage_client.bucket(GCS_BUCKET_NAME)
 
         if blob_name_to_download:
             try:
-                worker_blob = worker_bucket.blob(blob_name_to_download) # Get a fresh blob object per worker
+                # Create a fresh blob object tied to this worker's client/session
+                worker_blob = worker_bucket.blob(blob_name_to_download)
                 image_bytes = worker_blob.download_as_bytes()
                 original_pil = Image.open(io.BytesIO(image_bytes)).convert('L')
-                del image_bytes
+                del image_bytes # Free up bytes immediately after use
             except Exception as e:
                 # print(f"Error: Failed to load image {img_name} from GCS in __getitem__: {e}. Using dummy.")
-                original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0)
+                original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0) # Black dummy on failure
         else:
-            original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0)
+            original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0) # Black dummy if not found in map
 
 
         cropped_padded_pil_image = None
@@ -291,13 +337,15 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, rank, total
         xm.optimizer_step(optimizer, barrier=True)
         xm.mark_step()
 
+        # All-reduce loss to get a sum across all cores for consistent logging
         reduced_loss = xm.all_reduce(xm.REDUCE_SUM, loss)
         running_loss += reduced_loss.item() * images.size(0)
 
         if rank == 0:
             pbar.set_postfix(loss=reduced_loss.item())
 
-    total_samples_this_rank = len(dataloader.dataset)
+    # Aggregate total loss across all processes for epoch loss
+    total_samples_this_rank = len(dataloader.dataset) # Samples processed by this rank
     global_total_samples = xm.all_reduce(xm.REDUCE_SUM, torch.tensor(total_samples_this_rank, dtype=torch.float32, device=device))
     
     global_total_loss_sum = xm.all_reduce(xm.REDUCE_SUM, torch.tensor(running_loss, dtype=torch.float32, device=device))
@@ -363,7 +411,7 @@ def evaluate_model(model, dataloader, criterion, device, label_names, rank, tota
 
 
 # --- Main function for xmp.spawn ---
-def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list): # Pass gcs_blob_map_names
+def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list):
     # This function is executed by each process on its assigned TPU core
     device = xm.xla_device()
     print(f"Process {rank}: Starting on device {device}")
@@ -383,10 +431,9 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=False) # Verbose False for non-master
 
-    # --- Load train/val/test list files from GCS (each process can do this, cached by GCS client) ---
-    # Re-initialize GCS client per process for robustness in multi-worker setup.
-    # This is crucial for __getitem__ and data loading lists.
-    # Make sure this client is passed to NIHChestDataset or accessed within __getitem__ if needed.
+    # --- Re-initialize GCS client per process for robustness in multi-worker setup ---
+    # This ensures each worker has its own GCS client instance, preventing potential
+    # serialization/resource contention issues across processes.
     worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
     worker_bucket = worker_storage_client.bucket(GCS_BUCKET_NAME)
 
@@ -544,15 +591,14 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
 # --- Main execution block ---
 if __name__ == '__main__':
     # Ensure all global dataframes and maps are loaded before spawning
-    if data_entry_df is None or bbox_df is None or mlb is None or not gcs_blob_map:
+    if data_entry_df is None or bbox_df is None or mlb is None or not gcs_blob_map_names:
         print("ERROR: Global metadata (DataFrames, MLB, or GCS map) not fully loaded. Cannot proceed with training.")
         exit(1)
 
-    # Determine number of TPU cores available to this host (for informational print only)
+    # Get total accessible XLA cores (for informational print only)
     # The actual spawn will determine this from the environment
-    num_tpu_cores_info = xm.xla_device_count()
-    print(f"Main process: Attempting to spawn {num_tpu_cores_info} processes for TPU training.")
+    # num_tpu_cores_info = xm.xla_device_count()
+    # print(f"Main process: Attempting to spawn {num_tpu_cores_info} processes for TPU training.")
 
     # Call xmp.spawn with the _mp_fn and necessary global arguments
-    # gcs_blob_map is now passed as gcs_blob_map_names (containing only strings)
-    xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map, unique_labels_list,), nprocs=None, start_method='fork')
+    xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list,), nprocs=None, start_method='fork')
