@@ -11,7 +11,7 @@ from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader # DataLoader will be used by Trainer internally
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from google.cloud import storage
 from tqdm import tqdm # For terminal-based progress bars (running as .py script)
@@ -21,11 +21,13 @@ from transformers import ViTForImageClassification, ViTImageProcessor
 from transformers import TrainingArguments, Trainer
 
 # TPU-specific imports
-# Ensure these are at the very top of the script
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.distributed.parallel_loader as pl
+
+# Import tensorflow for TPUClusterResolver
+import tensorflow as tf
 
 print("All necessary libraries imported.")
 
@@ -34,9 +36,9 @@ print("All necessary libraries imported.")
 GCP_PROJECT_ID = "affable-alpha-454813-t8"
 GCS_BUCKET_NAME = "chest-xray-samir"
 
-GCS_IMAGE_BASE_PREFIX = "" # Confirm this is correct for your bucket structure
+GCS_IMAGE_BASE_PREFIX = "" # Confirm this is correct for your bucket structure (e.g., "", "data/", or "chest_x-ray/nih_chest_xray/")
 
-# GCS Paths to your metadata files
+# GCS Paths to your metadata files (assuming they are at the root of GCS_BUCKET_NAME)
 GCS_BBOX_CSV_PATH = "BBox_List_2017.csv"
 GCS_DATA_ENTRY_CSV_PATH = "Data_Entry_2017.csv"
 GCS_TRAIN_VAL_LIST_PATH = "train_val_list.txt"
@@ -60,79 +62,47 @@ BATCH_SIZE_PER_CORE = 16
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
-NUM_WORKERS = 8 # Number of CPU workers for data loading per DataLoader x 8
+NUM_WORKERS = 8 # Number of CPU workers for data loading per DataLoader
 
 # For faster development, use a subset of data
 USE_SUBSET_DATA = 1000 # Set to an integer (e.g., 1000) for fast testing, None for full dataset
 
-# TPU Configuration (from Cell 2 in previous Colab structure)
+# TPU Configuration
 TPU_NAME = "vit-training" # MUST match the name you used in `gcloud compute tpus tpu-vm create`
 TPU_ZONE = "europe-west4-a" # MUST match the zone you used (e.g., 'us-central1-b')
 
 print("Configuration set.")
 
+# --- Moved Global Variables and TPU Connection Logic ---
+# This block defines NUM_CLASSES and connects to TPU, so it must be run *before* anything uses NUM_CLASSES or the TPU device.
 
-# --- Connect to TPU Device ---
+# Initialize global variables that will be populated
+storage_client = None
+bucket = None
+bbox_df = None
+data_entry_df = None
+mlb = None
+unique_labels_list = []
+NUM_CLASSES = 0
+device = None # Will be set to XLA device or fallback
 
-if NUM_CLASSES == 0:
-    print("ERROR: NUM_CLASSES is 0. Cannot initialize model. Check previous cells for metadata loading errors.")
-    raise SystemExit("Model setup aborted.")
-
-# --- Connect to External TPU ---
-try:
-    print(f"Connecting to TPU: {TPU_NAME} in zone {TPU_ZONE}...")
-    tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=TPU_NAME, zone=TPU_ZONE, project=GCP_PROJECT_ID)
-    tf.config.experimental_connect_to_cluster(tpu_resolver)
-    tf.tpu.experimental.initialize_tpu_system(tpu_resolver)
-    print("TPU system initialized.")
-
-    # Get XLA device
-    device = xm.xla_device() # This should return a TPU device
-
-    # --- ADDED DIAGNOSTICS ---
-    print(f"Device returned by xm.xla_device(): {device}")
-    if xm.is_xla_device(device):
-        print("Confirmed: Device is an XLA device (TPU).")
-        print(f"Number of XLA devices: {xm.xla_device_count()}")
-        print(f"Current XLA device ordinal: {xm.get_ordinal()}")
-        print(f"Current XLA device: {xm.xla_real_device(device)}")
-        print(f"Current PyTorch version: {torch.__version__}")
-        print(f"Current TorchVision version: {torchvision.__version__}")
-        print(f"Current Torch/XLA version: {torch_xla.__version__}")
-    else:
-        print("WARNING: Device is NOT an XLA device. Fallback to CPU/GPU might have occurred, or connection failed silently.")
-    # --- END ADDED DIAGNOSTICS ---
-
-except Exception as e:
-    print(f"ERROR: Could not connect to external TPU: {e}")
-    print("Please ensure your TPU VM is running, its name/zone/project are correct, and IAM permissions are set.")
-    print("Falling back to CPU/GPU if available.")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using fallback device: {device}")
-
-
-#Load Metadata (BBox and Main Data_Entry), Label Binarization, and Helper Functions ---
-
+# --- Set up GCS client (used by multiple parts) ---
 storage_client = storage.Client(project=GCP_PROJECT_ID)
 bucket = storage_client.bucket(GCS_BUCKET_NAME)
 
-bbox_df = None
-data_entry_df = None
-mlb = None # MultiLabelBinarizer
-unique_labels_list = []
-NUM_CLASSES = 0
 
-print("\n--- Loading BBox_List_2017.csv ---")
+# --- Load Metadata (BBox and Main Data_Entry), Label Binarization ---
+print("\n--- Loading Metadata ---")
 try:
+    # --- Load and Process BBox_List_2017.csv ---
     print(f"Attempting to download {GCS_BBOX_CSV_PATH} from gs://{GCS_BUCKET_NAME}/...")
     bbox_blob = bucket.blob(GCS_BBOX_CSV_PATH)
     csv_bytes = bbox_blob.download_as_bytes()
     bbox_df = pd.read_csv(io.BytesIO(csv_bytes))
 
-    # Rename columns: 'Image Index', 'Finding Label', 'Bbox [x', 'y', 'w', 'h]'
-    bbox_df.columns = bbox_df.columns.str.replace('[\[\]]', '', regex=True) # Remove brackets
-    bbox_df.columns = bbox_df.columns.str.replace(' ', '_', regex=False)   # Replace spaces
-    bbox_df = bbox_df.loc[:, ~bbox_df.columns.str.contains('^Unnamed')] # Drop unnamed columns
+    bbox_df.columns = bbox_df.columns.str.replace('[\[\]]', '', regex=True)
+    bbox_df.columns = bbox_df.columns.str.replace(' ', '_', regex=False)
+    bbox_df = bbox_df.loc[:, ~bbox_df.columns.str.contains('^Unnamed')]
 
     print("BBox_List_2017.csv loaded successfully.")
     print(f"BBox DataFrame shape: {bbox_df.shape}")
@@ -157,21 +127,22 @@ except Exception as e:
     print("Please ensure GCS_BBOX_CSV_PATH is correct and the file exists at the root of your bucket.")
     bbox_df = None
     bbox_dict = {}
+    # If this fails, the script might need to exit or use a fallback for BBoxes.
+    # For now, let's allow it to continue with bbox_dict=None.
 
 
-print("\n--- Loading Data_Entry_2017.csv (Main Labels) ---")
+# --- Load and Process Data_Entry_2017.csv (Main Labels) ---
 try:
     print(f"Attempting to download {GCS_DATA_ENTRY_CSV_PATH} from gs://{GCS_BUCKET_NAME}/...")
     data_entry_blob = bucket.blob(GCS_DATA_ENTRY_CSV_PATH)
     csv_bytes_data_entry = data_entry_blob.download_as_bytes()
     data_entry_df = pd.read_csv(io.BytesIO(csv_bytes_data_entry))
 
-    # Clean Finding Labels and get unique labels
     data_entry_df['Finding Labels'] = data_entry_df['Finding Labels'].apply(
         lambda x: x.replace('No Finding', '').strip() if '|' in x else x
     )
     data_entry_df['Finding Labels'] = data_entry_df['Finding Labels'].apply(
-        lambda x: 'No Finding' if not x else x # If no other labels, put 'No Finding' back
+        lambda x: 'No Finding' if not x else x
     )
 
     all_labels_str = "|".join(data_entry_df['Finding Labels'].tolist())
@@ -179,7 +150,7 @@ try:
 
     if 'No Finding' not in unique_labels_list:
         unique_labels_list.append('No Finding')
-    unique_labels_list = sorted(unique_labels_list) # Sort again after potentially adding 'No Finding'
+    unique_labels_list = sorted(unique_labels_list)
 
     mlb = MultiLabelBinarizer(classes=unique_labels_list)
     mlb.fit(data_entry_df['Finding Labels'].apply(lambda x: x.split('|')))
@@ -197,14 +168,51 @@ except Exception as e:
     unique_labels_list = []
     NUM_CLASSES = 0
 
+# --- Connect to External TPU (now that NUM_CLASSES is defined) ---
+# This block should be after NUM_CLASSES is defined for the model instantiation part
+if NUM_CLASSES == 0:
+    print("ERROR: NUM_CLASSES is 0. Cannot proceed with TPU connection/model setup.")
+    raise SystemExit("TPU/Model setup aborted.")
 
-# --- Helper Functions ---
+try:
+    print(f"\nConnecting to TPU: {TPU_NAME} in zone {TPU_ZONE}...")
+    tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=TPU_NAME, zone=TPU_ZONE, project=GCP_PROJECT_ID)
+    tf.config.experimental_connect_to_cluster(tpu_resolver)
+    tf.tpu.experimental.initialize_tpu_system(tpu_resolver)
+    print("TPU system initialized.")
+
+    device = xm.xla_device() # Get XLA device
+
+    print(f"Device returned by xm.xla_device(): {device}")
+    if xm.is_xla_device(device):
+        print("Confirmed: Device is an XLA device (TPU).")
+        print(f"Number of XLA devices: {xm.xla_device_count()}")
+        print(f"Current XLA device ordinal: {xm.get_ordinal()}")
+        print(f"Current XLA device: {xm.xla_real_device(device)}")
+        print(f"Current PyTorch version: {torch.__version__}")
+        print(f"Current TorchVision version: {torchvision.__version__}")
+        print(f"Current Torch/XLA version: {torch_xla.__version__}")
+    else:
+        print("WARNING: Device is NOT an XLA device. Fallback to CPU/GPU might have occurred, or connection failed silently.")
+
+except Exception as e:
+    print(f"ERROR: Could not connect to external TPU: {e}")
+    print("Please ensure your TPU VM is running, its name/zone/project are correct, and IAM permissions are set.")
+    print("Falling back to CPU/GPU if available.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using fallback device: {device}")
+
+
+print("\nHelper functions and main metadata loaded.")
+
+
+# --- Helper Functions (Defined here, so they can access global config vars if needed) ---
 
 def pad_to_square(pil_img, padding_value=0):
     w, h = pil_img.size
     if w == h:
         return pil_img
-    mode = pil_img.mode # Keep original image mode (e.g., 'L' for grayscale)
+    mode = pil_img.mode
     if w > h:
         new_img = Image.new(mode, (w, w), padding_value)
         new_img.paste(pil_img, (0, (w - h) // 2))
@@ -222,9 +230,7 @@ def crop_and_pad_from_bbox(pil_img, bbox_coords, padding_value=0):
     right = min(img_w, x + w)
     lower = min(img_h, y + h)
 
-    # Handle cases where bbox is invalid or outside image
     if right <= left or lower <= upper or w <= 0 or h <= 0:
-        # Fallback to full image if bbox is invalid
         return pad_to_square(pil_img, padding_value)
 
     cropped_pil = pil_img.crop((left, upper, right, lower))
@@ -234,16 +240,13 @@ image_processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
 
 roi_preprocess_transforms = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.Lambda(lambda img: img.convert('RGB')), # Convert grayscale to RGB
+    transforms.Lambda(lambda img: img.convert('RGB')),
 ])
 
-print("\nHelper functions and main metadata loaded.")
-
-
-# --- NIHChestDataset Class Definition and DataLoader Creation for Trainer ---
 
 # --- Build GCS Image Path Map (Run Once at script start) ---
 # This map is crucial for quickly finding the GCS blob for a given image filename.
+# This must run *after* GCS client (storage_client, bucket) is initialized
 print("\n--- Building GCS Image Path Map (This may take a while for large datasets) ---")
 gcs_blob_map = {}
 image_subfolders = [f"images_{i:03}" for i in range(1, 13)] # images_001 to images_012
@@ -253,9 +256,7 @@ if base_img_prefix and not base_img_prefix.endswith('/'):
     base_img_prefix += '/'
 
 for subfolder in image_subfolders:
-    # This is a common NIH dataset structure: images_00X/images/FILENAME.png
-    # Adjust 'images/' if your files are directly in 'images_00X/'
-    current_prefix = f"{base_img_prefix}{subfolder}/images/"
+    current_prefix = f"{base_img_prefix}{subfolder}/images/" # Adjust if your files are directly in 'images_00X/'
     try:
         blobs_in_folder = list(bucket.list_blobs(prefix=current_prefix))
         for blob_obj in blobs_in_folder:
@@ -266,6 +267,8 @@ for subfolder in image_subfolders:
 print(f"Finished building GCS blob map with {len(gcs_blob_map)} unique image filenames.")
 
 
+# --- NIHChestDataset Class Definition and DataLoader Creation for Trainer ---
+
 class NIHChestDataset(Dataset):
     def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map=None, use_subset=None):
         self.transform = transform
@@ -273,48 +276,37 @@ class NIHChestDataset(Dataset):
         self.bbox_dict = bbox_dict
         self.gcs_blob_map = gcs_blob_map
 
-        # Filter the main DataFrame to only include images in the provided list for this split
         self.df_filtered = df[df['Image Index'].isin(image_filenames_list)].copy()
         self.df_filtered.set_index('Image Index', inplace=True)
 
-        # Prepare multi-hot encoded labels
-        # Handle 'No Finding' for accurate binarization
         self.labels_original_list = []
         for img_idx in self.df_filtered.index:
             labels_str = self.df_filtered.loc[img_idx, 'Finding Labels']
-            # Split and clean, if it results in empty, use ['No Finding']
             current_labels = [lbl.strip() for lbl in labels_str.split('|') if lbl.strip()]
             if not current_labels:
                 current_labels = ['No Finding']
             self.labels_original_list.append(current_labels)
 
         self.encoded_labels = label_binarizer.transform(self.labels_original_list)
-
-
         self.image_filenames = self.df_filtered.index.tolist()
 
-        if use_subset: # For faster testing
+        if use_subset:
             self.image_filenames = self.image_filenames[:use_subset]
-            self.encoded_labels = self.encoded_labels[:use_subset] # Match labels to subset
+            self.encoded_labels = self.encoded_labels[:use_subset]
 
-        # Pre-loading images into RAM is highly recommended for TPU/GPU performance
         self.images_in_memory = []
         print(f"Pre-loading {len(self.image_filenames)} images for this dataset split into RAM...")
         for img_name in tqdm(self.image_filenames, desc="Loading images to RAM"):
             blob_to_download = self.gcs_blob_map.get(img_name)
             if blob_to_download is None:
-                # Store a black dummy image if file not found
                 self.images_in_memory.append(Image.new('L', (IMG_SIZE, IMG_SIZE), color=0))
-                # print(f"Warning: Image {img_name} not found in GCS map during pre-load. Storing black dummy.")
             else:
                 try:
                     image_bytes = blob_to_download.download_as_bytes()
-                    self.images_in_memory.append(Image.open(io.BytesIO(image_bytes)).convert('L')) # Load as grayscale
-                    del image_bytes # Free up memory
+                    self.images_in_memory.append(Image.open(io.BytesIO(image_bytes)).convert('L'))
+                    del image_bytes
                 except Exception as e:
-                    # Store a black dummy image if error loading
                     self.images_in_memory.append(Image.new('L', (IMG_SIZE, IMG_SIZE), color=0))
-                    # print(f"Warning: Error loading {img_name} from GCS during pre-load: {e}. Storing black dummy.")
         print(f"Finished pre-loading {len(self.images_in_memory)} images for this split.")
 
 
@@ -322,32 +314,26 @@ class NIHChestDataset(Dataset):
         return len(self.image_filenames)
 
     def __getitem__(self, idx):
-        original_pil = self.images_in_memory[idx] # Get pre-loaded image
+        original_pil = self.images_in_memory[idx]
         img_name = self.image_filenames[idx]
         label_vector = torch.FloatTensor(self.encoded_labels[idx])
 
         cropped_padded_pil_image = None
-        # Use BBox cropping if available for this image, otherwise use full image (padded to square)
         if img_name in self.bbox_dict and self.bbox_dict[img_name]:
-            # For simplicity, use the first bounding box found for the image
             bbox_coords = self.bbox_dict[img_name][0]
             cropped_padded_pil_image = crop_and_pad_from_bbox(original_pil, bbox_coords, padding_value=0)
         else:
             cropped_padded_pil_image = pad_to_square(original_pil, padding_value=0)
 
-        # Apply torchvision transforms (e.g., Resize, Grayscale to RGB)
         if self.transform:
             cropped_padded_pil_image = self.transform(cropped_padded_pil_image)
 
-        # Use Hugging Face ViTImageProcessor for final normalization and ToTensor
         if self.image_processor:
             processed_output = self.image_processor(images=cropped_padded_pil_image, return_tensors="pt")
-            image_tensor = processed_output.pixel_values.squeeze(0) # Remove batch dimension added by processor
+            image_tensor = processed_output.pixel_values.squeeze(0)
         else:
-            # If not using HF processor, self.transform must include ToTensor and Normalize
             image_tensor = cropped_padded_pil_image
 
-        # Trainer expects a dictionary for inputs
         return {'pixel_values': image_tensor, 'labels': label_vector}
 
 
@@ -356,14 +342,12 @@ if data_entry_df is not None and mlb is not None and gcs_blob_map:
     print("\n--- Creating Datasets for Trainer ---")
 
     try:
-        # Load image filenames for splits from GCS
         train_val_list_blob = bucket.blob(GCS_TRAIN_VAL_LIST_PATH)
         train_val_files = train_val_list_blob.download_as_bytes().decode('utf-8').splitlines()
 
         test_list_blob = bucket.blob(GCS_TEST_LIST_PATH)
         test_files = test_list_blob.download_as_bytes().decode('utf-8').splitlines()
 
-        # Split train_val_files into actual train and validation
         train_files_final, val_files_final = train_test_split(train_val_files, test_size=0.15, random_state=42)
 
         print("Initializing Train Dataset...")
@@ -396,7 +380,6 @@ print("Datasets configured.")
 # --- Data Collator and Evaluation Metrics for Trainer ---
 
 def collate_fn(batch):
-    # Trainer expects a dictionary of lists/tensors
     pixel_values = torch.stack([x['pixel_values'] for x in batch])
     labels = torch.stack([x['labels'] for x in batch])
     return {
@@ -414,17 +397,14 @@ def compute_metrics(eval_pred):
 
     for i, label_name in enumerate(mlb.classes_):
         try:
-            # roc_auc_score requires at least two unique class labels in targets
             if len(np.unique(labels[:, i])) > 1:
                 class_roc_auc = roc_auc_score(labels[:, i], predictions[:, i])
                 auroc_per_class[label_name] = class_roc_auc
                 total_auroc += class_roc_auc
                 valid_classes_for_auroc += 1
             else:
-                # If only one class present (e.g., all 0s or all 1s), AUROC is undefined.
                 auroc_per_class[label_name] = np.nan
         except Exception as e:
-            # Catch other potential errors, e.g., if there's an issue with prediction/label arrays
             auroc_per_class[label_name] = np.nan
 
     avg_auroc = total_auroc / valid_classes_for_auroc if valid_classes_for_auroc > 0 else 0.0
@@ -441,9 +421,9 @@ else:
     model = ViTForImageClassification.from_pretrained(
         MODEL_NAME,
         num_labels=NUM_CLASSES,
-        ignore_mismatched_sizes=True, # Important for replacing the classifier head
-        id2label={i: c for i, c in enumerate(mlb.classes_)}, # For better logging/analysis
-        label2id={c: i for i, c in enumerate(mlb.classes_)} # For better logging/analysis
+        ignore_mismatched_sizes=True,
+        id2label={i: c for i, c in enumerate(mlb.classes_)},
+        label2id={c: i for i, c in enumerate(mlb.classes_)}
     )
 
     model.to(device) # Move model to the detected XLA or CPU/GPU device
@@ -458,49 +438,39 @@ if train_dataset is None or val_dataset is None or model is None:
 else:
     training_args = TrainingArguments(
       output_dir=OUTPUT_DIR,
-      # These batch sizes are PER DEVICE. Trainer handles distribution.
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE,
       
       dataloader_pin_memory=False,
-      # Evaluation strategy: 'steps' for regular evaluation (e.g., every eval_steps)
-      # or 'epoch' for evaluation at the end of each epoch.
-      eval_strategy="steps", # Evaluate at specific steps
-      eval_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 10), # Evaluate every 10% of an epoch for example
-      # Adjust eval_steps to a reasonable number. If eval_steps < 1, it won't evaluate.
-      # You might also set this to `len(train_loader)` to evaluate per epoch.
-
+      eval_strategy="steps",
+      eval_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 10),
+      
       num_train_epochs=NUM_EPOCHS,
       
-      # For TPUs, `fp16=True` internally translates to bfloat16.
-      # fp16=False,
-      # bf16=True,
-      
-      save_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 5), # Save checkpoint every 20% of an epoch
-      # Adjust save_steps similarly. If save_steps < 1, it won't save.
+      save_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 5),
 
-      logging_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 20), # Log every 5% of an epoch
+      logging_steps=len(train_dataset) // (BATCH_SIZE_PER_CORE * 20),
 
       learning_rate=LEARNING_RATE,
       weight_decay=WEIGHT_DECAY,
-      save_total_limit=2, # Keep only the last 2 checkpoints
-      remove_unused_columns=False, # Important if your dataset returns extra keys
+      save_total_limit=2,
+      remove_unused_columns=False,
       push_to_hub=False,
       report_to='tensorboard',
-      load_best_model_at_end=True, # Load the model with the best metric_for_best_model after training
-      metric_for_best_model="avg_auroc", # Metric to monitor for best model
-      greater_is_better=True, # For AUROC, higher is better
-      gradient_accumulation_steps=1, # Accumulate gradients over N steps before update (useful for larger effective batch size)
-      dataloader_num_workers=NUM_WORKERS # Number of subprocesses for data loading
+      load_best_model_at_end=True,
+      metric_for_best_model="avg_auroc",
+      greater_is_better=True,
+      gradient_accumulation_steps=1,
+      dataloader_num_workers=NUM_WORKERS
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        data_collator=collate_fn, # Custom collate function
-        compute_metrics=compute_metrics, # Custom metrics function
-        train_dataset=train_dataset, # Pass the PyTorch Dataset directly
-        eval_dataset=val_dataset,    # Pass the PyTorch Dataset directly
+        data_collator=collate_fn,
+        compute_metrics=compute_metrics,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
     )
 
     print("Training arguments and Trainer instantiated.")
@@ -510,21 +480,17 @@ else:
 
 if 'trainer' in globals():
     print("\n--- Starting Training ---")
-    train_results = trainer.train() # This starts the training loop
+    train_results = trainer.train()
 
-    # Save final model and metrics
     trainer.save_model()
     trainer.log_metrics("train", train_results.metrics)
     trainer.save_metrics("train", train_results.metrics)
-    trainer.save_state() # Saves Trainer's internal state (e.g., optimizer, scheduler)
+    trainer.save_state()
 
     print("\n--- Training Finished ---")
 
-    # --- Plotting Training History (Saved to File) ---
-    # Metrics are logged in trainer.state.log_history
     plt.figure(figsize=(12, 5))
     
-    # Loss Plot
     plt.subplot(1, 2, 1)
     train_losses = [log['loss'] for log in trainer.state.log_history if 'loss' in log and 'eval_loss' not in log]
     eval_losses = [log['eval_loss'] for log in trainer.state.log_history if 'eval_loss' in log]
@@ -541,7 +507,6 @@ if 'trainer' in globals():
     plt.legend()
     plt.grid(True)
 
-    # AUROC Plot
     plt.subplot(1, 2, 2)
     eval_auroc_history = [log['eval_avg_auroc'] for log in trainer.state.log_history if 'eval_avg_auroc' in log]
     if eval_auroc_history:
@@ -556,7 +521,7 @@ if 'trainer' in globals():
     plot_path = os.path.join(OUTPUT_DIR, "training_metrics_plot.png")
     plt.savefig(plot_path)
     print(f"Training metrics plot saved to {plot_path}")
-    plt.close() # Close the figure to free memory
+    plt.close()
 
 else:
     print("Trainer not instantiated. Skipping training execution.")
@@ -566,7 +531,6 @@ else:
 
 if 'trainer' in globals() and 'test_dataset' in globals() and test_dataset is not None:
     print("\n--- Evaluating on Test Set ---")
-    # The Trainer.evaluate() method expects a Dataset, not a DataLoader
     metrics = trainer.evaluate(test_dataset)
 
     trainer.log_metrics("eval", metrics)
@@ -574,9 +538,7 @@ if 'trainer' in globals() and 'test_dataset' in globals() and test_dataset is no
 
     print(f"\nTest results saved to {os.path.join(OUTPUT_DIR, 'eval_results.json')}")
     print("\nTest AUROC per class:")
-    # Filter for individual class AUROC scores
     test_auroc_per_class = {k.replace('eval_', ''): v for k, v in metrics.items() if k.startswith('eval_') and k not in ['eval_loss', 'eval_avg_auroc', 'eval_runtime', 'eval_samples_per_second', 'eval_steps_per_second']}
-    # Sort for better readability
     sorted_auroc = sorted(test_auroc_per_class.items(), key=lambda item: item[1] if not np.isnan(item[1]) else -1, reverse=True)
 
     for disease, score in sorted_auroc:
