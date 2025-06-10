@@ -1,14 +1,15 @@
 # Core PyTorch and XLA libraries
-#torch==2.0.1
-#torchvision==0.15.0
-#torch_xla[tpu]==2.0.0
+ pip install --upgrade torch_xla torch torchvision -f https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla_releases.html
 
 # Other core deep learning libraries
 transformers
 accelerate
 bitsandbytes
-#tensorflow-cpu
-#tf-keras
+
+# TensorFlow (CPU-only to avoid CUDA conflicts on TPU VMs)
+tensorflow-cpu
+
+# Cloud TPU client (often helpful on TPU VMs)
 cloud-tpu-client
 
 # Data handling and utility libraries
