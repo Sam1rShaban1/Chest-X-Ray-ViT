@@ -21,3 +21,4 @@ matplotlib
 scikit-learn
 google-cloud-storage
 tqdm
+libtpu
