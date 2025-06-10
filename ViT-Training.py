@@ -170,37 +170,38 @@ except Exception as e:
 
 # --- Connect to External TPU (now that NUM_CLASSES is defined) ---
 # This block should be after NUM_CLASSES is defined for the model instantiation part
+# --- Connect to External TPU (now that NUM_CLASSES is defined) ---
 if NUM_CLASSES == 0:
     print("ERROR: NUM_CLASSES is 0. Cannot proceed with TPU connection/model setup.")
     raise SystemExit("TPU/Model setup aborted.")
 
 try:
-    print(f"\nConnecting to TPU: {TPU_NAME} in zone {TPU_ZONE}...")
-    tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=TPU_NAME, zone=TPU_ZONE, project=GCP_PROJECT_ID)
-    tf.config.experimental_connect_to_cluster(tpu_resolver)
-    tf.tpu.experimental.initialize_tpu_system(tpu_resolver)
-    print("TPU system initialized.")
 
-    device = xm.xla_device() # Get XLA device
+    device = xm.xla_device()
 
     print(f"Device returned by xm.xla_device(): {device}")
     if xm.is_xla_device(device):
         print("Confirmed: Device is an XLA device (TPU).")
+        # In a multi-core setup, this will show the count of cores.
+        # When running a single process that uses all cores, it'll likely be 1 for the current process's view.
         print(f"Number of XLA devices: {xm.xla_device_count()}")
         print(f"Current XLA device ordinal: {xm.get_ordinal()}")
         print(f"Current XLA device: {xm.xla_real_device(device)}")
         print(f"Current PyTorch version: {torch.__version__}")
-        print(f"Current TorchVision version: {torchvision.__version__}")
         print(f"Current Torch/XLA version: {torch_xla.__version__}")
     else:
-        print("WARNING: Device is NOT an XLA device. Fallback to CPU/GPU might have occurred, or connection failed silently.")
+        print("WARNING: Device is NOT an XLA device. This script expects to run on a TPU VM.")
+        print("Falling back to CPU/GPU if available. This will be much slower.")
+        # Fallback if xm.xla_device() didn't find a TPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using fallback device: {device}")
 
 except Exception as e:
-    print(f"ERROR: Could not connect to external TPU: {e}")
-    print("Please ensure your TPU VM is running, its name/zone/project are correct, and IAM permissions are set.")
-    print("Falling back to CPU/GPU if available.")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using fallback device: {device}")
+    # This catch would now primarily be for issues with xm.xla_device() itself,
+    # or the underlying XLA setup, rather than connection to a remote host.
+    print(f"FATAL ERROR: Could not get XLA device: {e}")
+    print("Please ensure you are running this script inside a configured TPU VM environment.")
+    raise SystemExit("TPU device initialization failed.")
 
 
 print("\nHelper functions and main metadata loaded.")
