@@ -1,5 +1,16 @@
 # --- Library Imports ---
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# 2. Tell XLA to explicitly use the PJRT (TPU) backend
+os.environ["XRT_TPU_CONFIG"] = "localservice;0;localhost:51011" # Standard TPU VM config
+os.environ["XLA_USE_PJRT"] = "True" # Explicitly tell XLA to use PJRT backend
+os.environ["XLA_CLIENT_ALLOCATOR"] = "platform" # More explicit memory allocation for PJRT
+
+# 3. Suppress some potential backend warnings (optional, but can clean logs)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import io
 import json # For saving test results
 from PIL import Image, ImageDraw
@@ -411,25 +422,33 @@ def evaluate_model(model, dataloader, criterion, device, label_names, rank, tota
 
 
 # --- Main function for xmp.spawn ---
+# --- Main function for xmp.spawn ---
 def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list):
     # This function is executed by each process on its assigned TPU core
     device = xm.xla_device()
     print(f"Process {rank}: Starting on device {device}")
 
     # --- Initialize model on this device ---
+    # The fix for "Cannot copy out of meta tensor":
+    # 1. Load the configuration
     model = ViTForImageClassification.from_pretrained(
         MODEL_NAME,
         num_labels=NUM_CLASSES,
-        ignore_mismatched_sizes=True,
+        ignore_mismatched_sizes=True, # Replaces the classification head
         id2label={i: c for i, c in enumerate(unique_labels_list)},
-        label2id={c: i for i, c in enumerate(unique_labels_list)}
+        label2id={c: i for i, c in enumerate(unique_labels_list)},
+        # Explicitly move to device during loading, and set dtype for materialization.
+        # This bypasses the 'meta' tensor issue and helps with _init_weights.
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=False, # Ensure full materialization
+        device_map=device # Pass the XLA device directly to from_pretrained
     )
-    model.to(device)
+    # model.to(device) # No longer needed, as device_map handles it
 
     # --- Criterion and optimizer ---
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=False) # Verbose False for non-master
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=False)
 
     # --- Re-initialize GCS client per process for robustness in multi-worker setup ---
     # This ensures each worker has its own GCS client instance, preventing potential
@@ -601,4 +620,4 @@ if __name__ == '__main__':
     # print(f"Main process: Attempting to spawn {num_tpu_cores_info} processes for TPU training.")
 
     # Call xmp.spawn with the _mp_fn and necessary global arguments
-    xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list,), nprocs=None, start_method='fork')
+    xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list,), nprocs=None, start_method='spawn')
