@@ -13,7 +13,7 @@ os.environ["PJRT_DEVICE"] = "TPU"
 os.environ["XLA_USE_PJRT"] = "1"
 
 # --- Explicitly set LD_LIBRARY_PATH for libtpu.so ---
-libtpu_directory = "/home/ss31514/tpu_official_env/lib/python3.10/site-packages/libtpu" 
+libtpu_directory = "/home/ss31514/tpu_matched_env/lib/python3.10/site-packages/libtpu" 
 
 if os.path.exists(os.path.join(libtpu_directory, 'libtpu.so')):
     if 'LD_LIBRARY_PATH' in os.environ:
