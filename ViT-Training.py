@@ -386,7 +386,7 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
             num_labels=NUM_CLASSES,
             ignore_mismatched_sizes=True,
             id2label={i: c for i, c in enumerate(unique_labels_list)},
-            label2id={c: i for c, i in enumerate(unique_labels_list)}
+            label2id={c: i for c, i in enumerate(unique_labels_list)},
             device=device
         )
         print(f"Process {rank}: Model loaded and moved to device.")
