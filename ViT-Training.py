@@ -432,14 +432,14 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset,
         num_replicas=xm.torch_xla.device_count(),
-        rank=xm.get_ordinal(),
+        rank=rank,
         shuffle=True
     )
     
     val_sampler = torch.utils.data.distributed.DistributedSampler(
         val_dataset,
         num_replicas=xm.torch_xla.device_count(),
-        rank=xm.get_ordinal(),
+        rank=rank,
         shuffle=False
     )
 
@@ -509,6 +509,19 @@ if __name__ == '__main__':
     if data_entry_df is None or mlb is None or not gcs_blob_map_names:
         print("ERROR: Metadata not loaded properly. Cannot proceed.")
         exit(1)
+ try:
+        print("Main process: Pre-downloading/caching Hugging Face model to ensure all processes have it locally...")
+        # Call from_pretrained once in the main process to cache the model.
+        # num_labels doesn't matter for caching purposes.
+        _ = ViTForImageClassification.from_pretrained(MODEL_NAME)
+        _ = ViTImageProcessor.from_pretrained(MODEL_NAME) # Also pre-cache the processor
+        print("Main process: Model and processor pre-download complete.")
+    except Exception as e:
+        print(f"Main process: WARNING: Failed to pre-download model or processor: {e}")
+        print("Main process: Child processes might download concurrently, which could cause issues.")
+    # End of Pre-download/Cache block
 
+    # You can also change the print statement here as discussed previously
+    print("Starting training on TPU cores via xmp.spawn...")
     #print(f"Starting training on {xm.torch_xla.device_count()} TPU cores...")
     xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list), nprocs=None)
