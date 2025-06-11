@@ -5,7 +5,6 @@
 # Other core deep learning libraries
 transformers
 accelerate
-bitsandbytes
 
 # TensorFlow (CPU-only to avoid CUDA conflicts on TPU VMs)
 tensorflow-cpu
