@@ -44,12 +44,12 @@ from tqdm import tqdm
 # Hugging Face Transformers
 from transformers import ViTForImageClassification, ViTImageProcessor
 from transformers import Trainer, TrainingArguments
-from accelerate import Accelerator # <--- Import Accelerator
 
-# REMOVED TPU-specific imports from top-level:
-# import torch_xla
-# import torch_xla.core.xla_model as xm
-# import torch_xla.distributed.xla_multiprocessing as xmp
+# TPU-specific imports
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.parallel_loader as pl
 
 print("All necessary libraries imported.")
 
@@ -300,9 +300,8 @@ def collate_fn(batch):
     }
 
 # --- Compute Metrics for Trainer (AUROC) ---
-# Now accesses unique_labels_list as a global variable
 def compute_metrics_fn(eval_pred):
-    global unique_labels_list # Accessed as global inside this function
+    global unique_labels_list
 
     logits, labels = eval_pred.predictions, eval_pred.label_ids
     probs = torch.sigmoid(torch.tensor(logits)).numpy()
@@ -329,21 +328,13 @@ def compute_metrics_fn(eval_pred):
     return metrics
 
 
-# --- Main Training Function (REFRACTORED for accelerate) ---
-# RENAMED from _mp_fn to main and removed arguments
-def main(): # <--- Renamed and removed arguments
-    # TPU-specific imports (now inside the main function to avoid early XLA init)
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    import torch_xla
-
-    # Initialize Accelerator
-    accelerator = Accelerator()
-    process_rank = accelerator.process_index # Get the rank for this process
-    is_main_process = accelerator.is_main_process # Check if this is rank 0 for logging
-
-    if is_main_process:
-        print(f"Starting training run on device {accelerator.device}")
+# --- Main Training Function for TPU ---
+def _mp_fn(rank, world_size):
+    """Main training function for TPU multiprocessing"""
+    
+    # Initialize TPU device
+    device = xm.xla_device()
+    print(f"Process {rank}: Starting training on device {device}")
 
     # Access global variables for metadata
     global data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list, NUM_CLASSES
@@ -351,18 +342,16 @@ def main(): # <--- Renamed and removed arguments
     # Initialize image processor locally
     try:
         local_image_processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
-        if is_main_process:
-            print(f"Process {process_rank}: ViTImageProcessor initialized.")
+        print(f"Process {rank}: ViTImageProcessor initialized.")
     except Exception as e:
-        print(f"Process {process_rank}: Error initializing image processor: {e}")
+        print(f"Process {rank}: Error initializing image processor: {e}")
         return
 
     # Initialize model
     model = None
 
     try:
-        if is_main_process:
-            print(f"Process {process_rank}: Attempting to load model from {MODEL_NAME}...")
+        print(f"Process {rank}: Attempting to load model from {MODEL_NAME}...")
 
         model = ViTForImageClassification.from_pretrained(
             MODEL_NAME,
@@ -371,17 +360,17 @@ def main(): # <--- Renamed and removed arguments
             id2label={i: c for i, c in enumerate(unique_labels_list)},
             label2id={c: i for i, c in enumerate(unique_labels_list)}
         )
-        if is_main_process:
-            print(f"Process {process_rank}: Model loaded onto CPU. Trainer will move it to {accelerator.device}.")
+        
+        # Move model to TPU device
+        model = model.to(device)
+        print(f"Process {rank}: Model loaded and moved to TPU device: {device}")
 
     except Exception as e:
-        print(f"Process {process_rank}: FATAL ERROR during model loading: {e}")
-        if model is None:
-            print(f"Process {process_rank}: Model variable is still None after from_pretrained attempt. This indicates from_pretrained itself failed.")
+        print(f"Process {rank}: FATAL ERROR during model loading: {e}")
         return
 
     if model is None or not isinstance(model, torch.nn.Module):
-        print(f"Process {process_rank}: Critical: Model is None or not a valid PyTorch module after loading block. Exiting process.")
+        print(f"Process {rank}: Critical: Model is None or not a valid PyTorch module. Exiting process.")
         return
 
     # Load train/val/test splits
@@ -412,66 +401,159 @@ def main(): # <--- Renamed and removed arguments
         use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None
     )
 
-    if is_main_process:
-        print(f"Process {process_rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
+    print(f"Process {rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
 
-    # Define TrainingArguments
-    training_args = TrainingArguments(
-      output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{process_rank}"),
-      per_device_train_batch_size=BATCH_SIZE_PER_CORE,
-      per_device_eval_batch_size=BATCH_SIZE_PER_CORE,
-      evaluation_strategy="steps",
-      num_train_epochs=NUM_EPOCHS,
-      bf16=True, # CORRECT: Use bfloat16 for TPUs
-      save_steps=500,
-      eval_steps=500,
-      logging_steps=50,
-      learning_rate=LEARNING_RATE,
-      weight_decay=WEIGHT_DECAY,
-      save_total_limit=2,
-      remove_unused_columns=False,
-      push_to_hub=False,
-      report_to='tensorboard',
-      load_best_model_at_end=True,
-      metric_for_best_model="avg_auroc",
-      greater_is_better=True,
+    # Create data samplers for distributed training
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True
+    )
+    
+    val_sampler = torch.utils.data.distributed.DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
     )
 
-    # Create Trainer
-    # No closure needed for compute_metrics_fn as unique_labels_list is accessed globally
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        data_collator=collate_fn,
-        compute_metrics=compute_metrics_fn,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        tokenizer=local_image_processor,
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE_PER_CORE,
+        sampler=train_sampler,
+        collate_fn=collate_fn,
+        drop_last=True,
+        num_workers=0  # Important for TPU
     )
 
-    if is_main_process:
-        print(f"Process {process_rank}: Starting training with Trainer...")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE_PER_CORE,
+        sampler=val_sampler,
+        collate_fn=collate_fn,
+        drop_last=False,
+        num_workers=0  # Important for TPU
+    )
 
-    # Train
-    train_results = trainer.train()
+    # Wrap data loaders for TPU
+    train_loader = pl.MpDeviceLoader(train_loader, device)
+    val_loader = pl.MpDeviceLoader(val_loader, device)
 
-    if is_main_process:
-        trainer.save_model()
-        trainer.log_metrics("train", train_results.metrics)
-        trainer.save_metrics("train", train_results.metrics)
-        trainer.save_state()
-        print(f"Process {process_rank}: Training completed and model/logs saved.")
+    # Define loss function and optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-        # Evaluate final model on validation set
-        metrics = trainer.evaluate(val_dataset)
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-        print(f"Process {process_rank}: Final evaluation metrics: {metrics}")
+    # Training loop
+    model.train()
+    for epoch in range(NUM_EPOCHS):
+        train_sampler.set_epoch(epoch)
+        
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            optimizer.zero_grad()
+            
+            pixel_values = batch['pixel_values']
+            labels = batch['labels']
+            
+            # Forward pass
+            outputs = model(pixel_values=pixel_values)
+            logits = outputs.logits
+            
+            # Compute loss
+            loss = criterion(logits, labels)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Update weights with XLA optimization
+            xm.optimizer_step(optimizer)
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+            
+            if batch_idx % 50 == 0:
+                print(f"Process {rank}, Epoch {epoch+1}/{NUM_EPOCHS}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+        
+        avg_epoch_loss = epoch_loss / num_batches
+        print(f"Process {rank}, Epoch {epoch+1}/{NUM_EPOCHS} completed. Average Loss: {avg_epoch_loss:.4f}")
+        
+        # Validation at the end of each epoch
+        if rank == 0:  # Only run validation on rank 0
+            model.eval()
+            val_loss = 0.0
+            val_batches = 0
+            all_predictions = []
+            all_labels = []
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    pixel_values = batch['pixel_values']
+                    labels = batch['labels']
+                    
+                    outputs = model(pixel_values=pixel_values)
+                    logits = outputs.logits
+                    
+                    loss = criterion(logits, labels)
+                    val_loss += loss.item()
+                    val_batches += 1
+                    
+                    # Store predictions and labels for metrics
+                    predictions = torch.sigmoid(logits).cpu().numpy()
+                    all_predictions.append(predictions)
+                    all_labels.append(labels.cpu().numpy())
+            
+            # Compute validation metrics
+            if all_predictions:
+                all_predictions = np.concatenate(all_predictions, axis=0)
+                all_labels = np.concatenate(all_labels, axis=0)
+                
+                # Compute AUROC
+                valid_classes = 0
+                total_auroc = 0
+                
+                for i in range(NUM_CLASSES):
+                    try:
+                        if len(np.unique(all_labels[:, i])) > 1:
+                            class_roc_auc = roc_auc_score(all_labels[:, i], all_predictions[:, i])
+                            total_auroc += class_roc_auc
+                            valid_classes += 1
+                    except ValueError:
+                        pass
+                
+                avg_auroc = total_auroc / valid_classes if valid_classes > 0 else 0.0
+                avg_val_loss = val_loss / val_batches
+                
+                print(f"Process {rank}, Epoch {epoch+1}/{NUM_EPOCHS} - Validation Loss: {avg_val_loss:.4f}, Validation AUROC: {avg_auroc:.4f}")
+            
+            model.train()
+    
+    # Save model (only on rank 0)
+    if rank == 0:
+        output_path = os.path.join(OUTPUT_DIR, "final_model")
+        os.makedirs(output_path, exist_ok=True)
+        
+        # Save the model state dict
+        torch.save(model.state_dict(), os.path.join(output_path, "pytorch_model.bin"))
+        
+        # Save the model config
+        model.config.save_pretrained(output_path)
+        
+        # Save the image processor
+        local_image_processor.save_pretrained(output_path)
+        
+        print(f"Process {rank}: Model saved to {output_path}")
+
+    print(f"Process {rank}: Training completed successfully!")
+
 
 # --- Main Execution ---
 if __name__ == '__main__':
     # This block handles initial setup that should only happen once
-    # and load global variables before accelerate spawns processes.
+    # and load global variables before spawning processes.
 
     if data_entry_df is None or mlb is None or not gcs_blob_map_names:
         print("ERROR: Metadata not loaded properly. Cannot proceed.")
@@ -486,7 +568,12 @@ if __name__ == '__main__':
         print(f"Main process: WARNING: Failed to pre-download model or processor: {e}")
         print("Main process: Child processes might download concurrently, which could cause issues.")
 
-    # Crucial Change: Call the `main()` function directly.
-    # `accelerate launch` will automatically find and execute this `main()` function
-    # on each spawned process.
-    main() # <--- THIS IS THE ONLY LINE YOU NEED TO CALL HERE
+    # Start TPU multiprocessing
+    print("Starting TPU multiprocessing...")
+    
+    # Get the number of TPU cores
+    world_size = xm.xrt_world_size()
+    print(f"World size (number of TPU cores): {world_size}")
+    
+    # Launch training on all TPU cores
+    xmp.spawn(_mp_fn, args=(world_size,), nprocs=world_size, start_method='fork')
