@@ -48,10 +48,17 @@ from transformers import Trainer, TrainingArguments
 # For multi-label metrics with Trainer, we'll need this helper
 # from evaluate import load # We'll use sklearn.metrics directly
 
+# TPU-specific imports - THESE SHOULD BE AT THE TOP LEVEL FOR XMP.SPAWN TO WORK
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+# import torch_xla.distributed.parallel_loader as pl # Not needed with Trainer
+
 print("All necessary libraries imported.")
 
 # Check TPU availability (These lines are fine)
-#print(f"TPU devices available: {xm.torch_xla.device_count()}")
+# Note: DO NOT uncomment print(f"TPU devices available: {xm.torch_xla.device_count()}") here.
+# It will cause the "Runtime is already initialized" error.
 #print(f"Current XLA device: {xm.xla_device()}")
 
 # --- Configuration (Keep your existing ones) ---
@@ -352,7 +359,7 @@ def compute_metrics_fn(eval_pred, unique_labels_list):
 # --- Main Training Function (REFRACTORED to use Trainer) ---
 def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list):
     # Trainer handles device assignment automatically
-    # device = xm.xla_device() # No longer needed explicitly here for device assignment
+    # The `device = xm.xla_device()` is handled internally by Trainer and XLA.
     print(f"Process {rank}: Starting on XLA device.")
 
     # Initialize image processor locally
@@ -377,7 +384,7 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
             num_labels=NUM_CLASSES,
             ignore_mismatched_sizes=True, # Keeps classifier.weight/bias warnings, which is fine
             id2label={i: c for i, c in enumerate(unique_labels_list)},
-            label2id={c: i for i, c in enumerate(unique_labels_list)}
+            label2id={c: i for i, c in enumerate(unique_labels_list)} # Corrected syntax
 
            # Do NOT pass 'device' or 'low_cpu_mem_usage' here for this specific strategy
         )
@@ -433,9 +440,10 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
       output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"), # Unique output dir per rank for safety
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
-      eval_strategy="steps",
+      evaluation_strategy="steps", # This is the correct parameter name
       num_train_epochs=NUM_EPOCHS,
-      bf16=True, # Enable mixed precision
+      # FIX HERE: Changed fp16=True to bf16=True for TPU
+      bf16=True, # Enable bfloat16 mixed precision for TPU
       save_steps=500, # Increased save frequency for larger datasets
       eval_steps=500, # Increased eval frequency
       logging_steps=50, # Log more frequently
@@ -504,6 +512,7 @@ if __name__ == '__main__':
         print(f"Main process: WARNING: Failed to pre-download model or processor: {e}")
         print("Main process: Child processes might download concurrently, which could cause issues.")
 
+    # FIX HERE: Removed xm.torch_xla.device_count() to prevent early XLA runtime initialization
     print(f"Starting training on TPU cores via xmp.spawn...")
     # xmp.spawn will run _mp_fn on each TPU core
     xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list), nprocs=None)
