@@ -53,7 +53,7 @@ import torch_xla.distributed.parallel_loader as pl
 print("All necessary libraries imported.")
 
 # Check TPU availability
-print(f"TPU devices available: {xm.xla_device_count()}")
+print(f"TPU devices available: {xm.torch_xla.device_count()}")
 print(f"Current XLA device: {xm.xla_device()}")
 
 # --- Configuration ---
@@ -431,14 +431,14 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
     # Create data loaders
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset,
-        num_replicas=xm.xla_device_count(),
+        num_replicas=xm.torch_xla.device_count(),
         rank=xm.get_ordinal(),
         shuffle=True
     )
     
     val_sampler = torch.utils.data.distributed.DistributedSampler(
         val_dataset,
-        num_replicas=xm.xla_device_count(),
+        num_replicas=xm.torch_xla.device_count(),
         rank=xm.get_ordinal(),
         shuffle=False
     )
@@ -510,5 +510,5 @@ if __name__ == '__main__':
         print("ERROR: Metadata not loaded properly. Cannot proceed.")
         exit(1)
 
-    print(f"Starting training on {xm.xla_device_count()} TPU cores...")
+    print(f"Starting training on {xm.torch_xla.device_count()} TPU cores...")
     xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list), nprocs=None)
