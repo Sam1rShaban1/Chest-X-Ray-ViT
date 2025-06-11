@@ -1,4 +1,4 @@
-# --- Library Imports (Keep your existing ones) ---
+# --- Library Imports ---
 import os
 import site
 
@@ -27,7 +27,7 @@ else:
 import io
 import json
 from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt # Not used in final training, but keeping
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -43,25 +43,17 @@ from tqdm import tqdm
 
 # Hugging Face Transformers
 from transformers import ViTForImageClassification, ViTImageProcessor
-# ADD THESE IMPORTS FOR TRAINER
 from transformers import Trainer, TrainingArguments
-# For multi-label metrics with Trainer, we'll need this helper
-# from evaluate import load # We'll use sklearn.metrics directly
+from accelerate import Accelerator # <--- Import Accelerator
 
-# TPU-specific imports - THESE SHOULD BE AT THE TOP LEVEL FOR XMP.SPAWN TO WORK
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-# import torch_xla.distributed.parallel_loader as pl # Not needed with Trainer
+# REMOVED TPU-specific imports from top-level:
+# import torch_xla
+# import torch_xla.core.xla_model as xm
+# import torch_xla.distributed.xla_multiprocessing as xmp
 
 print("All necessary libraries imported.")
 
-# Check TPU availability (These lines are fine)
-# Note: DO NOT uncomment print(f"TPU devices available: {xm.torch_xla.device_count()}") here.
-# It will cause the "Runtime is already initialized" error.
-#print(f"Current XLA device: {xm.xla_device()}")
-
-# --- Configuration (Keep your existing ones) ---
+# --- Configuration ---
 GCP_PROJECT_ID = "affable-alpha-454813-t8"
 GCS_BUCKET_NAME = "chest-xray-samir"
 GCS_IMAGE_BASE_PREFIX = ""
@@ -79,19 +71,16 @@ IMG_SIZE = 384
 VIT_MEAN = [0.485, 0.456, 0.406]
 VIT_STD = [0.229, 0.224, 0.225]
 
-# Adjusted batch size for TPU
-# BATCH_SIZE_PER_CORE is now per_device_train_batch_size in TrainingArguments
 BATCH_SIZE_PER_CORE = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
-# NUM_WORKERS = 0 # Trainer usually handles this, or it can be set in DataLoaders. For XLA, 0 is often safe.
 
 USE_SUBSET_DATA = None
 
 print("Configuration set.")
 
-# --- Global Variables (Keep these for now, as _mp_fn needs them as args) ---
+# --- Global Variables ---
 bbox_df = None
 data_entry_df = None
 mlb = None
@@ -99,7 +88,7 @@ unique_labels_list = []
 NUM_CLASSES = 0
 gcs_blob_map_names = {}
 
-# --- Load Metadata (Keep your existing code for metadata loading) ---
+# --- Load Metadata ---
 print("\n--- Loading Metadata ---")
 try:
     _temp_storage_client = storage.Client(project=GCP_PROJECT_ID)
@@ -181,7 +170,7 @@ del _temp_bucket
 
 print("\nMetadata loaded successfully.")
 
-# --- Helper Functions (Keep your existing ones) ---
+# --- Helper Functions ---
 def pad_to_square(pil_img, padding_value=0):
     w, h = pil_img.size
     if w == h:
@@ -212,10 +201,10 @@ def crop_and_pad_from_bbox(pil_img, bbox_coords, padding_value=0):
 
 roi_preprocess_transforms = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.Lambda(lambda img: img.convert('RGB')), # Ensure 3 channels for ViT
+    transforms.Lambda(lambda img: img.convert('RGB')),
 ])
 
-# --- Build GCS Image Path Map (Keep your existing ones) ---
+# --- Build GCS Image Path Map ---
 print("\n--- Building GCS Image Path Map ---")
 _temp_storage_client_map = storage.Client(project=GCP_PROJECT_ID)
 _temp_bucket_map = _temp_storage_client_map.bucket(GCS_BUCKET_NAME)
@@ -239,7 +228,7 @@ print(f"Built GCS blob map with {len(gcs_blob_map_names)} unique image filenames
 del _temp_storage_client_map
 del _temp_bucket_map
 
-# --- Dataset Class (Keep, but modify to return dict expected by Trainer) ---
+# --- Dataset Class ---
 class NIHChestDataset(Dataset):
     def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map_names=None, use_subset=None):
         self.transform = transform
@@ -269,7 +258,6 @@ class NIHChestDataset(Dataset):
 
         blob_name_to_download = self.gcs_blob_names_for_dataset.get(img_name)
 
-        # Create GCS client for this worker (within __getitem__ is fine for XLA/multi-process)
         worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
         worker_bucket = worker_storage_client.bucket(GCS_BUCKET_NAME)
 
@@ -286,9 +274,8 @@ class NIHChestDataset(Dataset):
             print(f"Warning: Image {img_name} not found in GCS map. Returning dummy image.")
             original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0)
 
-        # Process bounding box
         if img_name in self.bbox_dict and self.bbox_dict[img_name]:
-            bbox_coords = self.bbox_dict[img_name][0] # Assuming one bbox per image or taking the first
+            bbox_coords = self.bbox_dict[img_name][0]
             cropped_padded_pil_image = crop_and_pad_from_bbox(original_pil, bbox_coords, padding_value=0)
         else:
             cropped_padded_pil_image = pad_to_square(original_pil, padding_value=0)
@@ -297,112 +284,105 @@ class NIHChestDataset(Dataset):
             cropped_padded_pil_image = self.transform(cropped_padded_pil_image)
 
         if self.image_processor:
-            # Use image_processor on the PIL image
             processed_output = self.image_processor(images=cropped_padded_pil_image, return_tensors="pt")
-            image_tensor = processed_output.pixel_values.squeeze(0) # Remove batch dimension added by processor
+            image_tensor = processed_output.pixel_values.squeeze(0)
         else:
             image_tensor = cropped_padded_pil_image
 
         return {'pixel_values': image_tensor, 'labels': label_vector}
 
 
-# --- NEW: Data Collator for Trainer ---
-# This is directly from the blog post, adapted slightly for our outputs
+# --- Data Collator for Trainer ---
 def collate_fn(batch):
-    # 'pixel_values' are already tensors from the image_processor
-    # 'labels' are already tensors from the dataset
     return {
         'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
-        'labels': torch.stack([x['labels'] for x in batch]) # Use stack for multi-label
+        'labels': torch.stack([x['labels'] for x in batch])
     }
 
-# --- NEW: Compute Metrics for Trainer (AUROC) ---
-# This will be defined within _mp_fn to access unique_labels_list via closure
-def compute_metrics_fn(eval_pred, unique_labels_list):
-    logits, labels = eval_pred.predictions, eval_pred.label_ids
-    # Convert logits to probabilities using sigmoid for multi-label classification
-    probs = torch.sigmoid(torch.tensor(logits)).numpy()
-    labels_np = labels # Already numpy array from Trainer
+# --- Compute Metrics for Trainer (AUROC) ---
+# Now accesses unique_labels_list as a global variable
+def compute_metrics_fn(eval_pred):
+    global unique_labels_list # Accessed as global inside this function
 
-    # Calculate AUROC per class
+    logits, labels = eval_pred.predictions, eval_pred.label_ids
+    probs = torch.sigmoid(torch.tensor(logits)).numpy()
+    labels_np = labels
+
     auroc_per_class = {}
     valid_classes = 0
     total_auroc = 0
 
     for i, label_name in enumerate(unique_labels_list):
         try:
-            # roc_auc_score requires at least two unique class values
             if len(np.unique(labels_np[:, i])) > 1:
                 class_roc_auc = roc_auc_score(labels_np[:, i], probs[:, i])
                 auroc_per_class[label_name] = class_roc_auc
                 total_auroc += class_roc_auc
                 valid_classes += 1
             else:
-                # If only one class is present, AUROC is undefined. Assign NaN or skip.
-                auroc_per_class[label_name] = np.nan # Or print a warning and skip
+                auroc_per_class[label_name] = np.nan
         except ValueError as e:
-            # Catch cases where roc_auc_score might fail (e.g., all predictions are same)
             auroc_per_class[label_name] = np.nan
-            # print(f"Warning: Could not calculate AUROC for class {label_name}: {e}")
 
     avg_auroc = total_auroc / valid_classes if valid_classes > 0 else 0.0
-
-    # Trainer expects a dictionary of metrics
     metrics = {"avg_auroc": avg_auroc}
-    # Optionally, include per-class AUROC for more detailed logging
-    # for k, v in auroc_per_class.items():
-    #     if not np.isnan(v):
-    #         metrics[f"auroc_{k}"] = v
     return metrics
 
 
-# --- Main Training Function (REFRACTORED to use Trainer) ---
-def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list):
-    # Trainer handles device assignment automatically
-    # The `device = xm.xla_device()` is handled internally by Trainer and XLA.
-    print(f"Process {rank}: Starting on XLA device.")
+# --- Main Training Function (REFRACTORED for accelerate) ---
+# RENAMED from _mp_fn to main and removed arguments
+def main(): # <--- Renamed and removed arguments
+    # TPU-specific imports (now inside the main function to avoid early XLA init)
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla
+
+    # Initialize Accelerator
+    accelerator = Accelerator()
+    process_rank = accelerator.process_index # Get the rank for this process
+    is_main_process = accelerator.is_main_process # Check if this is rank 0 for logging
+
+    if is_main_process:
+        print(f"Starting training run on device {accelerator.device}")
+
+    # Access global variables for metadata
+    global data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list, NUM_CLASSES
 
     # Initialize image processor locally
     try:
         local_image_processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
-        print(f"Process {rank}: ViTImageProcessor initialized.")
+        if is_main_process:
+            print(f"Process {process_rank}: ViTImageProcessor initialized.")
     except Exception as e:
-        print(f"Process {rank}: Error initializing image processor: {e}")
+        print(f"Process {process_rank}: Error initializing image processor: {e}")
         return
 
     # Initialize model
-    model = None # Initialize model to None for safety
+    model = None
 
     try:
-        print(f"Process {rank}: Attempting to load model from {MODEL_NAME}...")
+        if is_main_process:
+            print(f"Process {process_rank}: Attempting to load model from {MODEL_NAME}...")
 
-        # Strategy: Load on CPU first, then let Trainer handle moving to XLA device.
-        # This is the most robust approach for older transformers/torch_xla versions
-        # that struggle with direct-to-device loading or meta tensors.
         model = ViTForImageClassification.from_pretrained(
             MODEL_NAME,
             num_labels=NUM_CLASSES,
-            ignore_mismatched_sizes=True, # Keeps classifier.weight/bias warnings, which is fine
+            ignore_mismatched_sizes=True,
             id2label={i: c for i, c in enumerate(unique_labels_list)},
-            label2id={c: i for i, c in enumerate(unique_labels_list)} # Corrected syntax
-
-           # Do NOT pass 'device' or 'low_cpu_mem_usage' here for this specific strategy
+            label2id={c: i for i, c in enumerate(unique_labels_list)}
         )
-        print(f"Process {rank}: Model loaded onto CPU. Trainer will move it to XLA device.")
+        if is_main_process:
+            print(f"Process {process_rank}: Model loaded onto CPU. Trainer will move it to {accelerator.device}.")
 
     except Exception as e:
-        print(f"Process {rank}: FATAL ERROR during model loading: {e}")
+        print(f"Process {process_rank}: FATAL ERROR during model loading: {e}")
         if model is None:
-            print(f"Process {rank}: Model variable is still None after from_pretrained attempt. This indicates from_pretrained itself failed.")
-        return # Ensure the process exits if model loading fails
+            print(f"Process {process_rank}: Model variable is still None after from_pretrained attempt. This indicates from_pretrained itself failed.")
+        return
 
     if model is None or not isinstance(model, torch.nn.Module):
-        print(f"Process {rank}: Critical: Model is None or not a valid PyTorch module after loading block. Exiting process.")
-        return # Explicitly exit if model is still None or invalid
-
-    # No need for manual optimizer/criterion here, Trainer handles it
-    # criterion = nn.BCEWithLogitsLoss()
-    # optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        print(f"Process {process_rank}: Critical: Model is None or not a valid PyTorch module after loading block. Exiting process.")
+        return
 
     # Load train/val/test splits
     worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
@@ -432,87 +412,81 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
         use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None
     )
 
-    print(f"Process {rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
+    if is_main_process:
+        print(f"Process {process_rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
 
-    # Define TrainingArguments - mostly from blog post, adjusted for your needs
-    # Trainer handles distributed batching and sampling
+    # Define TrainingArguments
     training_args = TrainingArguments(
-      output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"), # Unique output dir per rank for safety
+      output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{process_rank}"),
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
-      per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
-      evaluation_strategy="steps", # This is the correct parameter name
+      per_device_eval_batch_size=BATCH_SIZE_PER_CORE,
+      evaluation_strategy="steps",
       num_train_epochs=NUM_EPOCHS,
-      # FIX HERE: Changed fp16=True to bf16=True for TPU
-      bf16=True, # Enable bfloat16 mixed precision for TPU
-      save_steps=500, # Increased save frequency for larger datasets
-      eval_steps=500, # Increased eval frequency
-      logging_steps=50, # Log more frequently
+      bf16=True, # CORRECT: Use bfloat16 for TPUs
+      save_steps=500,
+      eval_steps=500,
+      logging_steps=50,
       learning_rate=LEARNING_RATE,
       weight_decay=WEIGHT_DECAY,
       save_total_limit=2,
-      remove_unused_columns=False, # Crucial: tells Trainer not to drop image column
-      push_to_hub=False, # Set to True if you want to push to HF Hub
-      report_to='tensorboard', # Recommended for logging
+      remove_unused_columns=False,
+      push_to_hub=False,
+      report_to='tensorboard',
       load_best_model_at_end=True,
-      metric_for_best_model="avg_auroc", # Specify metric to track for best model
-      greater_is_better=True, # For AUROC, higher is better
-      # You might also want to set `dataloader_num_workers` here if not 0
-      # dataloader_num_workers=NUM_WORKERS, # Set to 0 for TPU usually
+      metric_for_best_model="avg_auroc",
+      greater_is_better=True,
     )
 
-    # Create a closure for compute_metrics to pass unique_labels_list
-    _compute_metrics = lambda eval_pred: compute_metrics_fn(eval_pred, unique_labels_list)
-
-    # Instantiate Trainer
+    # Create Trainer
+    # No closure needed for compute_metrics_fn as unique_labels_list is accessed globally
     trainer = Trainer(
         model=model,
         args=training_args,
-        data_collator=collate_fn, # Use our custom collate_fn
-        compute_metrics=_compute_metrics, # Use our adapted compute_metrics
+        data_collator=collate_fn,
+        compute_metrics=compute_metrics_fn,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        tokenizer=local_image_processor, # Pass processor here for saving config etc.
+        tokenizer=local_image_processor,
     )
 
-    print(f"Process {rank}: Starting training with Trainer...")
+    if is_main_process:
+        print(f"Process {process_rank}: Starting training with Trainer...")
 
     # Train
     train_results = trainer.train()
-    # Trainer automatically saves the best model if load_best_model_at_end is True
 
-    if rank == 0: # Only save logs/metrics from rank 0
-        trainer.save_model() # Saves the model (including best if configured)
+    if is_main_process:
+        trainer.save_model()
         trainer.log_metrics("train", train_results.metrics)
         trainer.save_metrics("train", train_results.metrics)
         trainer.save_state()
-        print(f"Process {rank}: Training completed and model/logs saved.")
+        print(f"Process {process_rank}: Training completed and model/logs saved.")
 
         # Evaluate final model on validation set
-        metrics = trainer.evaluate(val_dataset) # Evaluate on the actual val_dataset
+        metrics = trainer.evaluate(val_dataset)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-        print(f"Process {rank}: Final evaluation metrics: {metrics}")
+        print(f"Process {process_rank}: Final evaluation metrics: {metrics}")
 
-    # No need for xm.mark_step() or manual model saving inside epoch loop with Trainer
-
-# --- Main Execution (Keep your existing one) ---
+# --- Main Execution ---
 if __name__ == '__main__':
+    # This block handles initial setup that should only happen once
+    # and load global variables before accelerate spawns processes.
+
     if data_entry_df is None or mlb is None or not gcs_blob_map_names:
         print("ERROR: Metadata not loaded properly. Cannot proceed.")
         exit(1)
 
     try:
         print("Main process: Pre-downloading/caching Hugging Face model to ensure all processes have it locally...")
-        # Call from_pretrained once in the main process to cache the model.
-        # num_labels doesn't matter for caching purposes.
         _ = ViTForImageClassification.from_pretrained(MODEL_NAME)
-        _ = ViTImageProcessor.from_pretrained(MODEL_NAME) # Also pre-cache the processor
+        _ = ViTImageProcessor.from_pretrained(MODEL_NAME)
         print("Main process: Model and processor pre-download complete.")
     except Exception as e:
         print(f"Main process: WARNING: Failed to pre-download model or processor: {e}")
         print("Main process: Child processes might download concurrently, which could cause issues.")
 
-    # FIX HERE: Removed xm.torch_xla.device_count() to prevent early XLA runtime initialization
-    print(f"Starting training on TPU cores via xmp.spawn...")
-    # xmp.spawn will run _mp_fn on each TPU core
-    xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list), nprocs=None)
+    # Crucial Change: Call the `main()` function directly.
+    # `accelerate launch` will automatically find and execute this `main()` function
+    # on each spawned process.
+    main() # <--- THIS IS THE ONLY LINE YOU NEED TO CALL HERE
