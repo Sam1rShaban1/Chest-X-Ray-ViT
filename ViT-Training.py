@@ -329,11 +329,14 @@ def compute_metrics_fn(eval_pred):
 
 
 # --- Main Training Function for TPU ---
-def _mp_fn(rank, world_size):
+def _mp_fn(index):
     """Main training function for TPU multiprocessing"""
     
     # Initialize TPU device
     device = xm.xla_device()
+    rank = xm.get_ordinal()
+    world_size = xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else 8
+    
     print(f"Process {rank}: Starting training on device {device}")
 
     # Access global variables for metadata
@@ -571,9 +574,15 @@ if __name__ == '__main__':
     # Start TPU multiprocessing
     print("Starting TPU multiprocessing...")
     
-    # Get the number of TPU cores
-    world_size = xm.xrt_world_size()
-    print(f"World size (number of TPU cores): {world_size}")
+    # For TPU v3-8, we know there are 8 cores, but let's try to detect automatically
+    try:
+        import torch_xla.runtime as xr
+        world_size = xr.world_size()
+        print(f"Detected world size (number of TPU cores): {world_size}")
+    except:
+        # Fallback for TPU v3-8
+        world_size = 8
+        print(f"Using fallback world size for TPU v3-8: {world_size}")
     
     # Launch training on all TPU cores
-    xmp.spawn(_mp_fn, args=(world_size,), nprocs=world_size, start_method='fork')
+    xmp.spawn(_mp_fn, nprocs=world_size, start_method='fork')
