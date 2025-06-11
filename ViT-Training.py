@@ -65,14 +65,10 @@ VIT_MEAN = [0.485, 0.456, 0.406]
 VIT_STD = [0.229, 0.224, 0.225]
 
 # TPU-specific batch size: This is PER CORE.
-# For v3-8 (8 cores), total batch size will be BATCH_SIZE_PER_CORE * 8.
 BATCH_SIZE_PER_CORE = 16
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 4
-# Number of CPU workers for data loading *per process*.
-# Adjust this based on your VM's CPU cores per TPU core.
-# E.g., if v3-8 (8 cores) and VM has 32 vCPUs, you might use 4 workers per process (32/8).
 NUM_WORKERS = 4
 
 # For faster development, use a subset of data
@@ -540,7 +536,7 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
 
         if rank == 0:
             if val_avg_auroc > best_val_auroc:
-                best_val_auroc = val_avg_auroc
+                best_val_auroc = val_avg_auroc # Corrected typo here
                 xm.save(model.state_dict(), best_model_gcs_path) 
                 print(f"Process {rank}: New best model saved with Avg AUROC: {best_val_auroc:.4f} to {best_model_gcs_path}")
 
