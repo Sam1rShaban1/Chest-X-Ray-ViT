@@ -336,8 +336,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, rank, total
     pbar = tqdm(para_loader.per_device_loader(device), desc=f"Training (Rank {rank})", disable=(rank != 0))
 
     for i, batch in enumerate(pbar):
-        images = batch['pixel_values']
-        labels = batch['labels']
+        images = batch['pixel_values'].to(torch.bfloat16)
 
         optimizer.zero_grad()
 
@@ -377,7 +376,7 @@ def evaluate_model(model, dataloader, criterion, device, label_names, rank, tota
 
     with torch.no_grad():
         for batch in pbar:
-            images = batch['pixel_values']
+            images = batch['pixel_values'].to(torch.bfloat16)
             labels = batch['labels']
 
             outputs = model(images).logits
@@ -428,11 +427,8 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
     device = xm.xla_device()
     print(f"Process {rank}: Starting on device {device}")
 
-    print(f"Process {rank}: CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-    print(f"Process {rank}: XLA_USE_PJRT: {os.environ.get('XLA_USE_PJRT')}")
-    print(f"Process {rank}: PyTorch default device: {torch.get_default_device()}")
-    print(f"Process {rank}: torch.cuda.is_available(): {torch.cuda.is_available()}")
-    torch.set_default_device(device)
+    torch.set_default_device(device) 
+    print(f"Process {rank}: PyTorch default device (after setting): {torch.get_default_device()}")
     # --- Initialize model on this device ---
     model = ViTForImageClassification.from_pretrained(
         MODEL_NAME,
@@ -447,13 +443,15 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
         device_map=None # Pass the XLA device directly to from_pretrained
     )
 
-    model.to(device)
+    print(f"Process {rank}: Model loaded to CPU. Now attempting to move to XLA device and convert to bfloat16...")
+    model.to(device).to(torch.bfloat16) 
+    print(f"Process {rank}: Model successfully moved to XLA device (bfloat16).")
 
     xm.mark_step()
 
 
     # --- Criterion and optimizer ---
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=False)
 
@@ -465,7 +463,6 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
 
     train_val_list_blob = worker_bucket.blob(GCS_TRAIN_VAL_LIST_PATH)
     train_val_files = train_val_list_blob.download_as_bytes().decode('utf-8').splitlines()
-
     test_list_blob = worker_bucket.blob(GCS_TEST_LIST_PATH)
     test_files = test_list_blob.download_as_bytes().decode('utf-8').splitlines()
 
@@ -587,7 +584,7 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
             try:
                 # Load the best model's weights on the master process for final eval
                 model.load_state_dict(xm.load(best_model_gcs_path)) # Use xm.load() for GCS
-                model.to(device) # Ensure model is on device after loading state dict
+                model.to(device).to(torch.bfloat16) # Ensure model is on device after loading state dict
 
                 test_loss, test_avg_auroc, test_auroc_per_class = evaluate_model(model, test_loader, criterion, device, unique_labels_list, rank, xm.xla_device_count())
 
