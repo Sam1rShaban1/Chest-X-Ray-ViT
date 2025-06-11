@@ -48,12 +48,6 @@ from transformers import Trainer, TrainingArguments
 # For multi-label metrics with Trainer, we'll need this helper
 # from evaluate import load # We'll use sklearn.metrics directly
 
-# TPU-specific imports
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-# import torch_xla.distributed.parallel_loader as pl # Not needed with Trainer
-
 print("All necessary libraries imported.")
 
 # Check TPU availability (These lines are fine)
@@ -383,8 +377,9 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
             num_labels=NUM_CLASSES,
             ignore_mismatched_sizes=True, # Keeps classifier.weight/bias warnings, which is fine
             id2label={i: c for i, c in enumerate(unique_labels_list)},
-            label2id={c: i for c: i in enumerate(unique_labels_list)}
-            # Do NOT pass 'device' or 'low_cpu_mem_usage' here for this specific strategy
+            label2id={c: i for i, c in enumerate(unique_labels_list)}
+
+           # Do NOT pass 'device' or 'low_cpu_mem_usage' here for this specific strategy
         )
         print(f"Process {rank}: Model loaded onto CPU. Trainer will move it to XLA device.")
 
@@ -438,9 +433,9 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
       output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"), # Unique output dir per rank for safety
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
-      evaluation_strategy="steps",
+      eval_strategy="steps",
       num_train_epochs=NUM_EPOCHS,
-      fp16=True, # Enable mixed precision
+      bf16=True, # Enable mixed precision
       save_steps=500, # Increased save frequency for larger datasets
       eval_steps=500, # Increased eval frequency
       logging_steps=50, # Log more frequently
@@ -509,6 +504,6 @@ if __name__ == '__main__':
         print(f"Main process: WARNING: Failed to pre-download model or processor: {e}")
         print("Main process: Child processes might download concurrently, which could cause issues.")
 
-    print(f"Starting training on {xm.torch_xla.device_count()} TPU cores via xmp.spawn...")
+    print(f"Starting training on TPU cores via xmp.spawn...")
     # xmp.spawn will run _mp_fn on each TPU core
     xmp.spawn(_mp_fn, args=(data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list), nprocs=None)
