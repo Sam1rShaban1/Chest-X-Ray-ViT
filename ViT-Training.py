@@ -1,5 +1,6 @@
 # --- Library Imports ---
 import os
+import site # Import site (though we will hardcode the path now)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
@@ -8,8 +9,26 @@ os.environ["XRT_TPU_CONFIG"] = "localservice;0;localhost:51011" # Standard TPU V
 os.environ["XLA_USE_PJRT"] = "True" # Explicitly tell XLA to use PJRT backend
 os.environ["XLA_CLIENT_ALLOCATOR"] = "platform" # More explicit memory allocation for PJRT
 
-# 3. Suppress some potential backend warnings (optional, but can clean logs)
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2" # Suppress some warnings
+
+# --- Explicitly set LD_LIBRARY_PATH for libtpu.so ---
+# Path confirmed by 'find ~/tpu_official_env -name "libtpu.so"'
+# libtpu.so found at /home/ss31514/tpu_official_env/lib/python3.10/site-packages/libtpu/libtpu.so
+# So the directory is /home/ss31514/tpu_official_env/lib/python3.10/site-packages/libtpu
+libtpu_directory = "/home/ss31514/tpu_official_env/lib/python3.10/site-packages/libtpu" 
+
+if os.path.exists(os.path.join(libtpu_directory, 'libtpu.so')):
+    # Prepend this path to LD_LIBRARY_PATH
+    if 'LD_LIBRARY_PATH' in os.environ:
+        os.environ['LD_LIBRARY_PATH'] = f"{libtpu_directory}:{os.environ['LD_LIBRARY_PATH']}"
+    else:
+        os.environ['LD_LIBRARY_PATH'] = libtpu_directory
+    print(f"Main process: LD_LIBRARY_PATH set to: {os.environ['LD_LIBRARY_PATH']}")
+else:
+    print(f"Main process: WARNING: libtpu.so not found at expected path: {libtpu_directory}")
+    print("This might lead to 'Failed to open libtpu.so' errors.")
+# --- END LD_LIBRARY_PATH setting ---
+
 
 import io
 import json # For saving test results
@@ -536,7 +555,7 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
 
         if rank == 0:
             if val_avg_auroc > best_val_auroc:
-                best_val_auroc = val_avg_auroc # Corrected typo here
+                best_val_auroc = val_avg_auroc 
                 xm.save(model.state_dict(), best_model_gcs_path) 
                 print(f"Process {rank}: New best model saved with Avg AUROC: {best_val_auroc:.4f} to {best_model_gcs_path}")
 
