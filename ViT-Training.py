@@ -47,9 +47,9 @@ from transformers import Trainer, TrainingArguments
 
 # TPU-specific imports
 import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.parallel_loader as pl
+import torch_xla.core.xla_model as xm # KEEP THIS
+import torch_xla.distributed.xla_multiprocessing as xmp # KEEP THIS
+import torch_xla.distributed.parallel_loader as pl # KEEP THIS
 
 print("All necessary libraries imported.")
 
@@ -300,9 +300,7 @@ def collate_fn(batch):
     }
 
 # --- Compute Metrics for Trainer (AUROC) ---
-def compute_metrics_fn(eval_pred):
-    global unique_labels_list
-
+def compute_metrics_fn(eval_pred, unique_labels_list): # unique_labels_list is passed via closure
     logits, labels = eval_pred.predictions, eval_pred.label_ids
     probs = torch.sigmoid(torch.tensor(logits)).numpy()
     labels_np = labels
@@ -328,16 +326,16 @@ def compute_metrics_fn(eval_pred):
     return metrics
 
 
-# --- Main Training Function for TPU ---
-def _mp_fn(index):
+# --- Main Training Function for TPU multiprocessing via xmp.spawn ---
+def _mp_fn(index): # 'index' is the rank for this process
     """Main training function for TPU multiprocessing"""
-    
-    # Initialize TPU device
+
+    # Initialize TPU device and get rank/world_size
     device = xm.xla_device()
-    rank = xm.get_ordinal()
-    world_size = xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else 8
+    rank = index # Use the 'index' passed by xmp.spawn as the rank
+    world_size = xm.xla_replica_count() # Get the number of replicas/cores from XLA runtime
     
-    print(f"Process {rank}: Starting training on device {device}")
+    print(f"Process {rank}: Starting training on device {device} (World Size: {world_size})")
 
     # Access global variables for metadata
     global data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list, NUM_CLASSES
@@ -406,151 +404,64 @@ def _mp_fn(index):
 
     print(f"Process {rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
 
-    # Create data samplers for distributed training
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True
+    # Define TrainingArguments - mostly from blog post, adjusted for your needs
+    # Trainer handles distributed batching and sampling
+    training_args = TrainingArguments(
+      output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"), # Unique output dir per rank for safety
+      per_device_train_batch_size=BATCH_SIZE_PER_CORE,
+      per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
+      evaluation_strategy="steps", # This is the correct parameter name
+      num_train_epochs=NUM_EPOCHS,
+      bf16=True, # CORRECT: Use bfloat16 for TPUs
+      save_steps=500, # Increased save frequency for larger datasets
+      eval_steps=500, # Increased eval frequency
+      logging_steps=50, # Log more frequently
+      learning_rate=LEARNING_RATE,
+      weight_decay=WEIGHT_DECAY,
+      save_total_limit=2,
+      remove_unused_columns=False, # Crucial: tells Trainer not to drop image column
+      push_to_hub=False, # Set to True if you want to push to HF Hub
+      report_to='tensorboard', # Recommended for logging
+      load_best_model_at_end=True,
+      metric_for_best_model="avg_auroc", # Specify metric to track for best model
+      greater_is_better=True, # For AUROC, higher is better
+      # Trainer uses Accelerate internally, so dataloader_num_workers=0 is fine for TPU
     )
+
+    # Create a closure for compute_metrics to pass unique_labels_list
+    _compute_metrics = lambda eval_pred: compute_metrics_fn(eval_pred, unique_labels_list)
+
+    # Instantiate Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        data_collator=collate_fn,
+        compute_metrics=_compute_metrics,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=local_image_processor,
+    )
+
+    print(f"Process {rank}: Starting training with Trainer...")
+
+    # Train
+    train_results = trainer.train()
+
+    if rank == 0: # Only save logs/metrics from rank 0
+        trainer.save_model() # Saves the model (including best if configured)
+        trainer.log_metrics("train", train_results.metrics)
+        trainer.save_metrics("train", train_results.metrics)
+        trainer.save_state()
+        print(f"Process {rank}: Training completed and model/logs saved.")
+
+        # Evaluate final model on validation set
+        metrics = trainer.evaluate(val_dataset)
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        print(f"Process {rank}: Final evaluation metrics: {metrics}")
     
-    val_sampler = torch.utils.data.distributed.DistributedSampler(
-        val_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False
-    )
-
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE_PER_CORE,
-        sampler=train_sampler,
-        collate_fn=collate_fn,
-        drop_last=True,
-        num_workers=0  # Important for TPU
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE_PER_CORE,
-        sampler=val_sampler,
-        collate_fn=collate_fn,
-        drop_last=False,
-        num_workers=0  # Important for TPU
-    )
-
-    # Wrap data loaders for TPU
-    train_loader = pl.MpDeviceLoader(train_loader, device)
-    val_loader = pl.MpDeviceLoader(val_loader, device)
-
-    # Define loss function and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-
-    # Training loop
-    model.train()
-    for epoch in range(NUM_EPOCHS):
-        train_sampler.set_epoch(epoch)
-        
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        for batch_idx, batch in enumerate(train_loader):
-            optimizer.zero_grad()
-            
-            pixel_values = batch['pixel_values']
-            labels = batch['labels']
-            
-            # Forward pass
-            outputs = model(pixel_values=pixel_values)
-            logits = outputs.logits
-            
-            # Compute loss
-            loss = criterion(logits, labels)
-            
-            # Backward pass
-            loss.backward()
-            
-            # Update weights with XLA optimization
-            xm.optimizer_step(optimizer)
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-            
-            if batch_idx % 50 == 0:
-                print(f"Process {rank}, Epoch {epoch+1}/{NUM_EPOCHS}, Batch {batch_idx}, Loss: {loss.item():.4f}")
-        
-        avg_epoch_loss = epoch_loss / num_batches
-        print(f"Process {rank}, Epoch {epoch+1}/{NUM_EPOCHS} completed. Average Loss: {avg_epoch_loss:.4f}")
-        
-        # Validation at the end of each epoch
-        if rank == 0:  # Only run validation on rank 0
-            model.eval()
-            val_loss = 0.0
-            val_batches = 0
-            all_predictions = []
-            all_labels = []
-            
-            with torch.no_grad():
-                for batch in val_loader:
-                    pixel_values = batch['pixel_values']
-                    labels = batch['labels']
-                    
-                    outputs = model(pixel_values=pixel_values)
-                    logits = outputs.logits
-                    
-                    loss = criterion(logits, labels)
-                    val_loss += loss.item()
-                    val_batches += 1
-                    
-                    # Store predictions and labels for metrics
-                    predictions = torch.sigmoid(logits).cpu().numpy()
-                    all_predictions.append(predictions)
-                    all_labels.append(labels.cpu().numpy())
-            
-            # Compute validation metrics
-            if all_predictions:
-                all_predictions = np.concatenate(all_predictions, axis=0)
-                all_labels = np.concatenate(all_labels, axis=0)
-                
-                # Compute AUROC
-                valid_classes = 0
-                total_auroc = 0
-                
-                for i in range(NUM_CLASSES):
-                    try:
-                        if len(np.unique(all_labels[:, i])) > 1:
-                            class_roc_auc = roc_auc_score(all_labels[:, i], all_predictions[:, i])
-                            total_auroc += class_roc_auc
-                            valid_classes += 1
-                    except ValueError:
-                        pass
-                
-                avg_auroc = total_auroc / valid_classes if valid_classes > 0 else 0.0
-                avg_val_loss = val_loss / val_batches
-                
-                print(f"Process {rank}, Epoch {epoch+1}/{NUM_EPOCHS} - Validation Loss: {avg_val_loss:.4f}, Validation AUROC: {avg_auroc:.4f}")
-            
-            model.train()
-    
-    # Save model (only on rank 0)
-    if rank == 0:
-        output_path = os.path.join(OUTPUT_DIR, "final_model")
-        os.makedirs(output_path, exist_ok=True)
-        
-        # Save the model state dict
-        torch.save(model.state_dict(), os.path.join(output_path, "pytorch_model.bin"))
-        
-        # Save the model config
-        model.config.save_pretrained(output_path)
-        
-        # Save the image processor
-        local_image_processor.save_pretrained(output_path)
-        
-        print(f"Process {rank}: Model saved to {output_path}")
-
-    print(f"Process {rank}: Training completed successfully!")
+    # Ensure all processes finish training step before moving on, crucial for DDP
+    xm.mark_step()
 
 
 # --- Main Execution ---
@@ -571,18 +482,10 @@ if __name__ == '__main__':
         print(f"Main process: WARNING: Failed to pre-download model or processor: {e}")
         print("Main process: Child processes might download concurrently, which could cause issues.")
 
-    # Start TPU multiprocessing
-    print("Starting TPU multiprocessing...")
-    
-    # For TPU v3-8, we know there are 8 cores, but let's try to detect automatically
-    try:
-        import torch_xla.runtime as xr
-        world_size = xr.world_size()
-        print(f"Detected world size (number of TPU cores): {world_size}")
-    except:
-        # Fallback for TPU v3-8
-        world_size = 8
-        print(f"Using fallback world size for TPU v3-8: {world_size}")
+    # Get the total number of available TPU cores.
+    # This is safe to call here because xmp.spawn is about to be called.
+    world_size = xm.xla_device_count()
+    print(f"Starting TPU multiprocessing on {world_size} cores via xmp.spawn...")
     
     # Launch training on all TPU cores
     xmp.spawn(_mp_fn, nprocs=world_size, start_method='fork')
