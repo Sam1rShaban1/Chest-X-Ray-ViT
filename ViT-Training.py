@@ -428,9 +428,12 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
     device = xm.xla_device()
     print(f"Process {rank}: Starting on device {device}")
 
+    print(f"Process {rank}: CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    print(f"Process {rank}: XLA_USE_PJRT: {os.environ.get('XLA_USE_PJRT')}")
+    print(f"Process {rank}: PyTorch default device: {torch.get_default_device()}")
+    print(f"Process {rank}: torch.cuda.is_available(): {torch.cuda.is_available()}")
+    torch.set_default_device(device)
     # --- Initialize model on this device ---
-    # The fix for "Cannot copy out of meta tensor":
-    # 1. Load the configuration
     model = ViTForImageClassification.from_pretrained(
         MODEL_NAME,
         num_labels=NUM_CLASSES,
@@ -441,9 +444,13 @@ def _mp_fn(rank, data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_label
         # This bypasses the 'meta' tensor issue and helps with _init_weights.
         torch_dtype=torch.float32,
         low_cpu_mem_usage=False, # Ensure full materialization
-        device_map=device # Pass the XLA device directly to from_pretrained
+        device_map=None # Pass the XLA device directly to from_pretrained
     )
-    # model.to(device) # No longer needed, as device_map handles it
+
+    model.to(device)
+
+    xm.mark_step()
+
 
     # --- Criterion and optimizer ---
     criterion = nn.BCEWithLogitsLoss()
