@@ -5,7 +5,7 @@ import site
 # CRITICAL TPU ENVIRONMENT SETUP - MUST BE FIRST
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_USE_BF16"] = "1"  # Enable bfloat16 for TPU
-os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "100000000"  # Prevent memory issues
+os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "100000000000"  # Prevent memory issues 100GB
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # TPU-specific environment variables
@@ -374,7 +374,8 @@ def _mp_fn(index): # 'index' is the rank for this process
             num_labels=NUM_CLASSES,
             ignore_mismatched_sizes=True,
             id2label={i: c for i, c in enumerate(unique_labels_list)},
-            label2id={c: i for i, c in enumerate(unique_labels_list)}
+            label2id={c: i for i, c in enumerate(unique_labels_list)},
+            device_map=None
         )
         
         # Move model to TPU device
@@ -438,7 +439,7 @@ def _mp_fn(index): # 'index' is the rank for this process
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
       eval_strategy="steps", # This is the correct parameter name
       num_train_epochs=NUM_EPOCHS,
-      bf16=True, # CORRECT: Use bfloat16 for TPUs (re-enabled as discussed)
+      #bf16=True, # CORRECT: Use bfloat16 for TPUs (re-enabled as discussed)
       save_steps=50, # Increased save frequency for larger datasets
       eval_steps=50, # Increased eval frequency
       logging_steps=50, # Log more frequently
