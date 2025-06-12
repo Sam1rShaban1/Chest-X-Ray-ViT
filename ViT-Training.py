@@ -233,17 +233,14 @@ del _temp_bucket_map
 # --- Dataset Class ---
 # --- Dataset Class (CRITICAL FIX - MUST APPLY THESE CHANGES) ---
 class NIHChestDataset(Dataset):
-    # ADD gcs_client and gcs_bucket to the constructor signature
-    def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map_names=None, use_subset=None, gcs_client=None, gcs_bucket=None): # <--- ADDED PARAMS HERE
+    def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map_names=None, use_subset=None, gcs_client=None, gcs_bucket=None):
         self.transform = transform
         self.image_processor = image_processor
         self.bbox_dict = bbox_dict
         self.label_binarizer = label_binarizer
         self.gcs_blob_names_for_dataset = gcs_blob_map_names
-
-        # CRITICAL: Store the GCS client and bucket passed to the constructor
-        self.gcs_client = gcs_client # <--- ADD THIS LINE
-        self.gcs_bucket = gcs_bucket # <--- ADD THIS LINE
+        self.gcs_client = gcs_client # Correctly storing the client
+        self.gcs_bucket = gcs_bucket # Correctly storing the bucket
 
         self.df_filtered = df[df['Image Index'].isin(image_filenames_list)].copy()
         self.df_filtered.set_index('Image Index', inplace=True)
