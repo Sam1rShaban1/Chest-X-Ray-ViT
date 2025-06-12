@@ -231,13 +231,19 @@ del _temp_storage_client_map
 del _temp_bucket_map
 
 # --- Dataset Class ---
+# --- Dataset Class (CRITICAL FIX - MUST APPLY THESE CHANGES) ---
 class NIHChestDataset(Dataset):
-    def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map_names=None, use_subset=None):
+    # ADD gcs_client and gcs_bucket to the constructor signature
+    def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map_names=None, use_subset=None, gcs_client=None, gcs_bucket=None): # <--- ADDED PARAMS HERE
         self.transform = transform
         self.image_processor = image_processor
         self.bbox_dict = bbox_dict
         self.label_binarizer = label_binarizer
         self.gcs_blob_names_for_dataset = gcs_blob_map_names
+
+        # CRITICAL: Store the GCS client and bucket passed to the constructor
+        self.gcs_client = gcs_client # <--- ADD THIS LINE
+        self.gcs_bucket = gcs_bucket # <--- ADD THIS LINE
 
         self.df_filtered = df[df['Image Index'].isin(image_filenames_list)].copy()
         self.df_filtered.set_index('Image Index', inplace=True)
@@ -275,6 +281,8 @@ class NIHChestDataset(Dataset):
             print(f"Warning: Image {img_name} not found in GCS map. Returning dummy image.")
             original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0)
 
+        # ... (rest of your __getitem__ remains the same) ...
+
         if img_name in self.bbox_dict and self.bbox_dict[img_name]:
             bbox_coords = self.bbox_dict[img_name][0]
             cropped_padded_pil_image = crop_and_pad_from_bbox(original_pil, bbox_coords, padding_value=0)
@@ -303,8 +311,11 @@ def collate_fn(batch):
 # --- Compute Metrics for Trainer (AUROC) ---
 def compute_metrics_fn(eval_pred, unique_labels_list): # unique_labels_list is passed via closure
     logits, labels = eval_pred.predictions, eval_pred.label_ids
-    probs = torch.sigmoid(torch.tensor(logits)).numpy()
-    labels_np = labels
+    
+    # OPTIMIZED LINE: Use scipy's expit for element-wise sigmoid on NumPy array
+    probs = expit(logits) 
+    
+    labels_np = labels # eval_pred.label_ids is already a NumPy array
 
     auroc_per_class = {}
     valid_classes = 0
@@ -312,14 +323,19 @@ def compute_metrics_fn(eval_pred, unique_labels_list): # unique_labels_list is p
 
     for i, label_name in enumerate(unique_labels_list):
         try:
-            if len(np.unique(labels_np[:, i])) > 1:
+            # Ensure there are at least two unique actual labels (binary classification requirement for roc_auc_score)
+            # and at least two samples in the array to avoid ValueError.
+            if len(np.unique(labels_np[:, i])) > 1 and labels_np.shape[0] >= 2:
                 class_roc_auc = roc_auc_score(labels_np[:, i], probs[:, i])
                 auroc_per_class[label_name] = class_roc_auc
                 total_auroc += class_roc_auc
                 valid_classes += 1
             else:
+                # If only one class is present or not enough samples, AUC is undefined.
                 auroc_per_class[label_name] = np.nan
         except ValueError as e:
+            # Catch specific ValueError if roc_auc_score encounters an issue despite checks
+            # (e.g., all predictions are identical for a class, which can happen with small batches)
             auroc_per_class[label_name] = np.nan
 
     avg_auroc = total_auroc / valid_classes if valid_classes > 0 else 0.0
@@ -328,13 +344,14 @@ def compute_metrics_fn(eval_pred, unique_labels_list): # unique_labels_list is p
 
 
 # --- Main Training Function for TPU multiprocessing via xmp.spawn ---
+# --- Main Training Function for TPU multiprocessing via xmp.spawn (COMPLETE SNIPPET) ---
 def _mp_fn(index): # 'index' is the rank for this process
     """Main training function for TPU multiprocessing"""
 
     # Initialize TPU device and get rank/world_size
     device = xm.xla_device()
     rank = index # Use the 'index' passed by xmp.spawn as the rank
-    world_size = xr.addressable_device_count()
+    world_size = xr.addressable_device_count() # Correct usage for world_size
     
     print(f"Process {rank}: Starting training on device {device} (World Size: {world_size})")
 
@@ -375,24 +392,33 @@ def _mp_fn(index): # 'index' is the rank for this process
         print(f"Process {rank}: Critical: Model is None or not a valid PyTorch module. Exiting process.")
         return
 
-    # Load train/val/test splits
+    # --- CRITICAL FIX: Initialize GCS Client and Bucket ONCE PER PROCESS HERE ---
     worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
     worker_bucket = worker_storage_client.bucket(GCS_BUCKET_NAME)
+    print(f"Process {rank}: GCS client and bucket initialized.")
 
-    train_val_list_blob = worker_bucket.blob(GCS_TRAIN_VAL_LIST_PATH)
-    train_val_files = train_val_list_blob.download_as_bytes().decode('utf-8').splitlines()
-    test_list_blob = worker_bucket.blob(GCS_TEST_LIST_PATH)
-    test_files = test_list_blob.download_as_bytes().decode('utf-8').splitlines()
+    # Load train/val/test splits using the pre-initialized bucket
+    try:
+        train_val_list_blob = worker_bucket.blob(GCS_TRAIN_VAL_LIST_PATH)
+        train_val_files = train_val_list_blob.download_as_bytes().decode('utf-8').splitlines()
+        test_list_blob = worker_bucket.blob(GCS_TEST_LIST_PATH)
+        test_files = test_list_blob.download_as_bytes().decode('utf-8').splitlines()
+        print(f"Process {rank}: Train/Val/Test lists loaded.")
+    except Exception as e:
+        print(f"Process {rank}: FATAL ERROR loading train/val/test lists from GCS: {e}")
+        return
 
     train_files_final, val_files_final = train_test_split(train_val_files, test_size=0.15, random_state=42)
 
-    # Create datasets
+    # --- CRITICAL FIX: Create datasets by passing the INITIALIZED CLIENT AND BUCKET ---
     train_dataset = NIHChestDataset(
         data_entry_df, train_files_final, bbox_dict, mlb,
         transform=roi_preprocess_transforms,
         image_processor=local_image_processor,
         gcs_blob_map_names=gcs_blob_map_names,
-        use_subset=USE_SUBSET_DATA
+        use_subset=USE_SUBSET_DATA,
+        gcs_client=worker_storage_client, # Pass client to dataset
+        gcs_bucket=worker_bucket # Pass bucket to dataset
     )
 
     val_dataset = NIHChestDataset(
@@ -400,7 +426,9 @@ def _mp_fn(index): # 'index' is the rank for this process
         transform=roi_preprocess_transforms,
         image_processor=local_image_processor,
         gcs_blob_map_names=gcs_blob_map_names,
-        use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None
+        use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None,
+        gcs_client=worker_storage_client, # Pass client to dataset
+        gcs_bucket=worker_bucket # Pass bucket to dataset
     )
 
     print(f"Process {rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
@@ -413,7 +441,7 @@ def _mp_fn(index): # 'index' is the rank for this process
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
       eval_strategy="steps", # This is the correct parameter name
       num_train_epochs=NUM_EPOCHS,
-      bf16=True, # CORRECT: Use bfloat16 for TPUs
+      bf16=True, # CORRECT: Use bfloat16 for TPUs (re-enabled as discussed)
       save_steps=50, # Increased save frequency for larger datasets
       eval_steps=50, # Increased eval frequency
       logging_steps=50, # Log more frequently
@@ -440,7 +468,7 @@ def _mp_fn(index): # 'index' is the rank for this process
         compute_metrics=_compute_metrics,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        processing_class=local_image_processor,
+        tokenizer=local_image_processor, # Use tokenizer here, processing_class is an Accelerate feature, Trainer wants tokenizer
     )
 
     print(f"Process {rank}: Starting training with Trainer...")
