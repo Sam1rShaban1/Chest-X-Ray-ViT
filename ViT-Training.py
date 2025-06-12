@@ -40,6 +40,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from google.cloud import storage
 from tqdm import tqdm
+from scipy.special import expit
 
 # Hugging Face Transformers
 from transformers import ViTForImageClassification, ViTImageProcessor
@@ -259,8 +260,7 @@ class NIHChestDataset(Dataset):
 
         blob_name_to_download = self.gcs_blob_names_for_dataset.get(img_name)
 
-        worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
-        worker_bucket = worker_storage_client.bucket(GCS_BUCKET_NAME)
+        worker_bucket = self.gcs_bucket
 
         if blob_name_to_download:
             try:
@@ -413,7 +413,7 @@ def _mp_fn(index): # 'index' is the rank for this process
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
       eval_strategy="steps", # This is the correct parameter name
       num_train_epochs=NUM_EPOCHS,
-      #bf16=True, # CORRECT: Use bfloat16 for TPUs
+      bf16=True, # CORRECT: Use bfloat16 for TPUs
       save_steps=50, # Increased save frequency for larger datasets
       eval_steps=50, # Increased eval frequency
       logging_steps=50, # Log more frequently
