@@ -4,8 +4,8 @@ import site
 
 # CRITICAL TPU ENVIRONMENT SETUP - MUST BE FIRST
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["XLA_USE_BF16"] = "1"  # Enable bfloat16 for TPU
-os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "100000000000"  # Prevent memory issues 100GB
+os.environ["XLA_USE_BF16"] = "1"  # This is NOT used by Trainer for TPUs, but OK as an XLA env var
+os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "100000000000"  # 100GB - Good setting
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # TPU-specific environment variables
@@ -48,9 +48,9 @@ from transformers import Trainer, TrainingArguments
 
 # TPU-specific imports
 import torch_xla
-import torch_xla.core.xla_model as xm # KEEP THIS
-import torch_xla.distributed.xla_multiprocessing as xmp # KEEP THIS
-import torch_xla.distributed.parallel_loader as pl # KEEP THIS
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.parallel_loader as pl
 import torch_xla.runtime as xr
 
 print("All necessary libraries imported.")
@@ -78,35 +78,35 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 2
 
-USE_SUBSET_DATA = 500
+USE_SUBSET_DATA = 500 # Ensure this subset is small enough for testing
 
 print("Configuration set.")
 
-# --- Global Variables ---
-bbox_df = None
-data_entry_df = None
-mlb = None
-unique_labels_list = []
-NUM_CLASSES = 0
-gcs_blob_map_names = {}
+# --- Global Variables (will be populated in main, then passed) ---
+# It's cleaner to remove these global = None lines, but leaving them commented for clarity.
+# bbox_df = None
+# data_entry_df = None
+# mlb = None
+# unique_labels_list = []
+# NUM_CLASSES = 0
+# gcs_blob_map_names = {}
 
-# --- Load Metadata ---
-print("\n--- Loading Metadata ---")
-try:
-    _temp_storage_client = storage.Client(project=GCP_PROJECT_ID)
-    _temp_bucket = _temp_storage_client.bucket(GCS_BUCKET_NAME)
 
-    print(f"Downloading {GCS_BBOX_CSV_PATH}...")
-    bbox_blob = _temp_bucket.blob(GCS_BBOX_CSV_PATH)
+# --- New Function to Load All Global Metadata in Main Process ---
+def load_global_metadata(project_id, bucket_name, bbox_csv_path, data_entry_csv_path, image_base_prefix, gcs_image_subfolders):
+    # Initialize GCS client and bucket for this one-time loading in the main process
+    _storage_client = storage.Client(project=project_id)
+    _bucket = _storage_client.bucket(bucket_name)
+
+    # --- Load BBox Data ---
+    print(f"Main process: Downloading {bbox_csv_path}...")
+    bbox_blob = _bucket.blob(bbox_csv_path)
     csv_bytes = bbox_blob.download_as_bytes()
     bbox_df = pd.read_csv(io.BytesIO(csv_bytes))
-
     bbox_df.columns = bbox_df.columns.str.replace('[\[\]]', '', regex=True)
     bbox_df.columns = bbox_df.columns.str.replace(' ', '_', regex=False)
     bbox_df = bbox_df.loc[:, ~bbox_df.columns.str.contains('^Unnamed')]
-
-    print("BBox_List_2017.csv loaded successfully.")
-    print(f"BBox DataFrame shape: {bbox_df.shape}")
+    print("Main process: BBox_List_2017.csv loaded successfully.")
 
     bbox_dict = {}
     for index, row in bbox_df.iterrows():
@@ -121,19 +121,13 @@ try:
         if img_idx not in bbox_dict:
             bbox_dict[img_idx] = []
         bbox_dict[img_idx].append(bbox_info)
-    print(f"Created bbox_dict with {len(bbox_dict)} unique image entries.")
-
-except Exception as e:
-    print(f"ERROR: Failed to load BBox_List_2017.csv: {e}")
-    bbox_df = None
-    bbox_dict = {}
-
-try:
-    print(f"Downloading {GCS_DATA_ENTRY_CSV_PATH}...")
-    data_entry_blob = _temp_bucket.blob(GCS_DATA_ENTRY_CSV_PATH)
+    print(f"Main process: Created bbox_dict with {len(bbox_dict)} unique image entries.")
+    
+    # --- Load Data Entry Data ---
+    print(f"Main process: Downloading {data_entry_csv_path}...")
+    data_entry_blob = _bucket.blob(data_entry_csv_path)
     csv_bytes_data_entry = data_entry_blob.download_as_bytes()
     data_entry_df = pd.read_csv(io.BytesIO(csv_bytes_data_entry))
-
     data_entry_df['Finding Labels'] = data_entry_df['Finding Labels'].apply(
         lambda x: x.replace('No Finding', '').strip() if '|' in x else x
     )
@@ -143,36 +137,45 @@ try:
 
     all_labels_str = "|".join(data_entry_df['Finding Labels'].tolist())
     unique_labels_list = sorted(list(set([lbl for lbl in all_labels_str.split('|') if lbl])))
-
     if 'No Finding' not in unique_labels_list:
         unique_labels_list.append('No Finding')
     unique_labels_list = sorted(unique_labels_list)
 
     mlb = MultiLabelBinarizer(classes=unique_labels_list)
     mlb.fit(data_entry_df['Finding Labels'].apply(lambda x: x.split('|')))
-    NUM_CLASSES = len(unique_labels_list)
+    num_classes = len(unique_labels_list)
+    print("Main process: Data_Entry_2017.csv loaded successfully.")
+    print(f"Main process: Total unique labels: {unique_labels_list}")
+    print(f"Main process: Number of classes: {num_classes}")
 
-    print("Data_Entry_2017.csv loaded successfully.")
-    print(f"Total unique labels: {unique_labels_list}")
-    print(f"Number of classes: {NUM_CLASSES}")
+    if num_classes == 0:
+        print("Main process: FATAL: NUM_CLASSES is 0. Exiting.")
+        exit(1)
 
-except Exception as e:
-    print(f"ERROR: Failed to load Data_Entry_2017.csv: {e}")
-    data_entry_df = None
-    mlb = None
-    unique_labels_list = []
-    NUM_CLASSES = 0
+    # --- Build GCS Image Path Map ---
+    print("\n--- Main process: Building GCS Image Path Map ---")
+    gcs_blob_map_names = {}
+    base_img_prefix_local = image_base_prefix # Use local copy
+    if base_img_prefix_local and not base_img_prefix_local.endswith('/'):
+        base_img_prefix_local += '/'
 
-if NUM_CLASSES == 0:
-    print("FATAL: NUM_CLASSES is 0. Exiting.")
-    exit(1)
+    for subfolder in gcs_image_subfolders: # Use passed list of subfolders
+        current_prefix = f"{base_img_prefix_local}{subfolder}/images/"
+        try:
+            blobs_in_folder = list(_bucket.list_blobs(prefix=current_prefix))
+            for blob_obj in blobs_in_folder:
+                if not blob_obj.name.endswith('/'):
+                    gcs_blob_map_names[os.path.basename(blob_obj.name)] = blob_obj.name
+        except Exception as e:
+            print(f"Main process: Warning: Error listing blobs from {current_prefix}: {e}")
 
-del _temp_storage_client
-del _temp_bucket
+    print(f"Main process: Built GCS blob map with {len(gcs_blob_map_names)} unique image filenames.")
 
-print("\nMetadata loaded successfully.")
+    # Return all the data needed by child processes
+    return bbox_df, bbox_dict, data_entry_df, mlb, unique_labels_list, num_classes, gcs_blob_map_names
 
-# --- Helper Functions ---
+
+# --- Helper Functions (keep as is) ---
 def pad_to_square(pil_img, padding_value=0):
     w, h = pil_img.size
     if w == h:
@@ -206,48 +209,25 @@ roi_preprocess_transforms = transforms.Compose([
     transforms.Lambda(lambda img: img.convert('RGB')),
 ])
 
-# --- Build GCS Image Path Map ---
-print("\n--- Building GCS Image Path Map ---")
-_temp_storage_client_map = storage.Client(project=GCP_PROJECT_ID)
-_temp_bucket_map = _temp_storage_client_map.bucket(GCS_BUCKET_NAME)
 
-image_subfolders = [f"images_{i:03}" for i in range(1, 13)]
-base_img_prefix = GCS_IMAGE_BASE_PREFIX
-if base_img_prefix and not base_img_prefix.endswith('/'):
-    base_img_prefix += '/'
-
-for subfolder in image_subfolders:
-    current_prefix = f"{base_img_prefix}{subfolder}/images/"
-    try:
-        blobs_in_folder = list(_temp_bucket_map.list_blobs(prefix=current_prefix))
-        for blob_obj in blobs_in_folder:
-            if not blob_obj.name.endswith('/'):
-                gcs_blob_map_names[os.path.basename(blob_obj.name)] = blob_obj.name
-    except Exception as e:
-        print(f"Warning: Error listing blobs from {current_prefix}: {e}")
-
-print(f"Built GCS blob map with {len(gcs_blob_map_names)} unique image filenames.")
-del _temp_storage_client_map
-del _temp_bucket_map
-
-# --- Dataset Class ---
-# --- Dataset Class (CRITICAL FIX - MUST APPLY THESE CHANGES) ---
+# --- Dataset Class (Updated to use passed dataframes) ---
 class NIHChestDataset(Dataset):
-    def __init__(self, df, image_filenames_list, bbox_dict, label_binarizer, transform=None, image_processor=None, gcs_blob_map_names=None, use_subset=None, gcs_client=None, gcs_bucket=None):
+    def __init__(self, df_for_dataset, image_filenames_list, bbox_dict_global, label_binarizer_global, transform=None, image_processor=None, gcs_blob_map_names_global=None, use_subset=None, gcs_client=None, gcs_bucket=None):
         self.transform = transform
         self.image_processor = image_processor
-        self.bbox_dict = bbox_dict
-        self.label_binarizer = label_binarizer
-        self.gcs_blob_names_for_dataset = gcs_blob_map_names
-        self.gcs_client = gcs_client # Correctly storing the client
-        self.gcs_bucket = gcs_bucket # Correctly storing the bucket
+        self.bbox_dict = bbox_dict_global # Use the global dict passed
+        self.label_binarizer = label_binarizer_global # Use the global mlb passed
+        self.gcs_blob_names_for_dataset = gcs_blob_map_names_global # Use the global map passed
+        self.gcs_client = gcs_client
+        self.gcs_bucket = gcs_bucket
 
-        self.df_filtered = df[df['Image Index'].isin(image_filenames_list)].copy()
-        self.df_filtered.set_index('Image Index', inplace=True)
-        self.image_filenames = self.df_filtered.index.tolist()
+        # CRITICAL: df_for_dataset is assumed to be already filtered for this dataset's specific files
+        self.df_filtered = df_for_dataset # Pass the already filtered DataFrame slice
+        self.df_filtered.set_index('Image Index', inplace=True) # Ensure index is set
+        self.image_filenames = image_filenames_list # This list should be the actual subset for this dataset
 
-        if use_subset:
-            self.image_filenames = self.image_filenames[:use_subset]
+        if use_subset: # This subsetting should ideally happen before passing image_filenames_list
+            self.image_filenames = self.image_filenames[:use_subset] # Keep for safety, but check caller
 
         self.encoded_labels = self.label_binarizer.transform(
             self.df_filtered.loc[self.image_filenames, 'Finding Labels'].apply(lambda x: x.split('|'))
@@ -263,7 +243,7 @@ class NIHChestDataset(Dataset):
 
         blob_name_to_download = self.gcs_blob_names_for_dataset.get(img_name)
 
-        worker_bucket = self.gcs_bucket
+        worker_bucket = self.gcs_bucket # CRITICAL: uses stored bucket
 
         if blob_name_to_download:
             try:
@@ -272,13 +252,12 @@ class NIHChestDataset(Dataset):
                 original_pil = Image.open(io.BytesIO(image_bytes)).convert('L')
                 del image_bytes
             except Exception as e:
-                print(f"Warning: Could not download image {img_name}: {e}. Returning dummy image.")
+                # Add process PID to warnings for clarity
+                print(f"Process {os.getpid()}: Warning: Could not download image {img_name}: {e}. Returning dummy image.")
                 original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0)
         else:
-            print(f"Warning: Image {img_name} not found in GCS map. Returning dummy image.")
+            print(f"Process {os.getpid()}: Warning: Image {img_name} not found in GCS map. Returning dummy image.")
             original_pil = Image.new('L', (IMG_SIZE, IMG_SIZE), color=0)
-
-        # ... (rest of your __getitem__ remains the same) ...
 
         if img_name in self.bbox_dict and self.bbox_dict[img_name]:
             bbox_coords = self.bbox_dict[img_name][0]
@@ -340,20 +319,20 @@ def compute_metrics_fn(eval_pred, unique_labels_list): # unique_labels_list is p
     return metrics
 
 
-# --- Main Training Function for TPU multiprocessing via xmp.spawn ---
-# --- Main Training Function for TPU multiprocessing via xmp.spawn (COMPLETE SNIPPET) ---
-def _mp_fn(index): # 'index' is the rank for this process
+# --- Main Training Function for TPU multiprocessing via xmp.spawn (MODIFIED TO ACCEPT SHARED METADATA) ---
+def _mp_fn(index, shared_metadata): # 'index' is rank, 'shared_metadata' is the tuple
     """Main training function for TPU multiprocessing"""
+
+    # Unpack shared metadata received from the main process
+    (global_bbox_df, global_bbox_dict, global_data_entry_df, global_mlb,
+     global_unique_labels_list, global_num_classes, global_gcs_blob_map_names) = shared_metadata
 
     # Initialize TPU device and get rank/world_size
     device = xm.xla_device()
-    rank = index # Use the 'index' passed by xmp.spawn as the rank
-    world_size = xr.addressable_device_count() # Correct usage for world_size
+    rank = index
+    world_size = xr.addressable_device_count()
     
     print(f"Process {rank}: Starting training on device {device} (World Size: {world_size})")
-
-    # Access global variables for metadata
-    global data_entry_df, bbox_dict, mlb, gcs_blob_map_names, unique_labels_list, NUM_CLASSES
 
     # Initialize image processor locally
     try:
@@ -371,16 +350,16 @@ def _mp_fn(index): # 'index' is the rank for this process
 
         model = ViTForImageClassification.from_pretrained(
             MODEL_NAME,
-            num_labels=NUM_CLASSES,
+            num_labels=global_num_classes, # Use num_classes from shared_metadata
             ignore_mismatched_sizes=True,
-            id2label={i: c for i, c in enumerate(unique_labels_list)},
-            label2id={c: i for i, c in enumerate(unique_labels_list)},
-            device_map=None
+            id2label={i: c for i, c in enumerate(global_unique_labels_list)}, # Use from shared_metadata
+            label2id={c: i for i, c in enumerate(global_unique_labels_list)}, # Use from shared_metadata
+            device_map=None # Load to CPU first, Trainer will move to TPU
         )
         
-        # Move model to TPU device
-        model = model.to(device)
-        print(f"Process {rank}: Model loaded and moved to TPU device: {device}")
+        # Remove explicit model.to(device) - Trainer handles this
+        # model = model.to(device)
+        print(f"Process {rank}: Model loaded (on CPU). Trainer will move it to TPU.")
 
     except Exception as e:
         print(f"Process {rank}: FATAL ERROR during model loading: {e}")
@@ -390,7 +369,7 @@ def _mp_fn(index): # 'index' is the rank for this process
         print(f"Process {rank}: Critical: Model is None or not a valid PyTorch module. Exiting process.")
         return
 
-    # --- CRITICAL FIX: Initialize GCS Client and Bucket ONCE PER PROCESS HERE ---
+    # Initialize GCS Client and Bucket ONCE PER PROCESS HERE
     worker_storage_client = storage.Client(project=GCP_PROJECT_ID)
     worker_bucket = worker_storage_client.bucket(GCS_BUCKET_NAME)
     print(f"Process {rank}: GCS client and bucket initialized.")
@@ -408,65 +387,74 @@ def _mp_fn(index): # 'index' is the rank for this process
 
     train_files_final, val_files_final = train_test_split(train_val_files, test_size=0.15, random_state=42)
 
-    # --- CRITICAL FIX: Create datasets by passing the INITIALIZED CLIENT AND BUCKET ---
+    # Filter data_entry_df for the current process's dataset splits *before* passing to NIHChestDataset
+    # This creates small, picklable DataFrame slices for each dataset.
+    train_df_current_process = global_data_entry_df[global_data_entry_df['Image Index'].isin(train_files_final)].copy()
+    val_df_current_process = global_data_entry_df[global_data_entry_df['Image Index'].isin(val_files_final)].copy()
+
+    # Create datasets by passing the INITALIZED CLIENT AND BUCKET, and FILTERED DATAFRAMES
     train_dataset = NIHChestDataset(
-        data_entry_df, train_files_final, bbox_dict, mlb,
+        train_df_current_process, # Pass the filtered df
+        train_files_final, # This list is already correct
+        global_bbox_dict, # Pass the global bbox_dict
+        global_mlb, # Pass the global mlb
         transform=roi_preprocess_transforms,
         image_processor=local_image_processor,
-        gcs_blob_map_names=gcs_blob_map_names,
+        gcs_blob_map_names=global_gcs_blob_map_names, # Pass the global map
         use_subset=USE_SUBSET_DATA,
-        gcs_client=worker_storage_client, # Pass client to dataset
-        gcs_bucket=worker_bucket # Pass bucket to dataset
+        gcs_client=worker_storage_client,
+        gcs_bucket=worker_bucket
     )
 
     val_dataset = NIHChestDataset(
-        data_entry_df, val_files_final, bbox_dict, mlb,
+        val_df_current_process, # Pass the filtered df
+        val_files_final, # This list is already correct
+        global_bbox_dict, # Pass the global bbox_dict
+        global_mlb, # Pass the global mlb
         transform=roi_preprocess_transforms,
         image_processor=local_image_processor,
-        gcs_blob_map_names=gcs_blob_map_names,
+        gcs_blob_map_names=global_gcs_blob_map_names, # Pass the global map
         use_subset=USE_SUBSET_DATA // 5 if USE_SUBSET_DATA else None,
-        gcs_client=worker_storage_client, # Pass client to dataset
-        gcs_bucket=worker_bucket # Pass bucket to dataset
+        gcs_client=worker_storage_client,
+        gcs_bucket=worker_bucket
     )
 
     print(f"Process {rank}: Train dataset: {len(train_dataset)}, Val dataset: {len(val_dataset)}")
 
-    # Define TrainingArguments - mostly from blog post, adjusted for your needs
-    # Trainer handles distributed batching and sampling
+    # Define TrainingArguments
     training_args = TrainingArguments(
-      output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"), # Unique output dir per rank for safety
+      output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"),
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
-      per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
-      eval_strategy="steps", # This is the correct parameter name
+      per_device_eval_batch_size=BATCH_SIZE_PER_CORE,
+      eval_strategy="steps",
       num_train_epochs=NUM_EPOCHS,
-      #bf16=True, # CORRECT: Use bfloat16 for TPUs (re-enabled as discussed)
-      save_steps=50, # Increased save frequency for larger datasets
-      eval_steps=50, # Increased eval frequency
-      logging_steps=50, # Log more frequently
+      # bf16=True, # Leave commented out for TPUs
+      save_steps=50,
+      eval_steps=50,
+      logging_steps=50,
       learning_rate=LEARNING_RATE,
       weight_decay=WEIGHT_DECAY,
       save_total_limit=2,
-      remove_unused_columns=False, # Crucial: tells Trainer not to drop image column
-      push_to_hub=False, # Set to True if you want to push to HF Hub
-      report_to='tensorboard', # Recommended for logging
+      remove_unused_columns=False,
+      push_to_hub=False,
+      report_to='tensorboard',
       load_best_model_at_end=True,
-      metric_for_best_model="avg_auroc", # Specify metric to track for best model
-      greater_is_better=True, # For AUROC, higher is better
-      # Trainer uses Accelerate internally, so dataloader_num_workers=0 is fine for TPU
+      metric_for_best_model="avg_auroc",
+      greater_is_better=True,
     )
 
-    # Create a closure for compute_metrics to pass unique_labels_list
-    _compute_metrics = lambda eval_pred: compute_metrics_fn(eval_pred, unique_labels_list)
+    # Create a closure for compute_metrics to pass unique_labels_list (from shared_metadata)
+    _compute_metrics = lambda eval_pred: compute_metrics_fn(eval_pred, global_unique_labels_list)
 
     # Instantiate Trainer
     trainer = Trainer(
-        model=model,
+        model=model, # Model is loaded to CPU, Trainer will move to TPU
         args=training_args,
         data_collator=collate_fn,
         compute_metrics=_compute_metrics,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        tokenizer=local_image_processor, # Use tokenizer here, processing_class is an Accelerate feature, Trainer wants tokenizer
+        tokenizer=local_image_processor,
     )
 
     print(f"Process {rank}: Starting training with Trainer...")
@@ -475,7 +463,7 @@ def _mp_fn(index): # 'index' is the rank for this process
     train_results = trainer.train()
 
     if rank == 0: # Only save logs/metrics from rank 0
-        trainer.save_model() # Saves the model (including best if configured)
+        trainer.save_model()
         trainer.log_metrics("train", train_results.metrics)
         trainer.save_metrics("train", train_results.metrics)
         trainer.save_state()
@@ -487,19 +475,27 @@ def _mp_fn(index): # 'index' is the rank for this process
         trainer.save_metrics("eval", metrics)
         print(f"Process {rank}: Final evaluation metrics: {metrics}")
     
-    # Ensure all processes finish training step before moving on, crucial for DDP
-    xm.mark_step()
+    xm.mark_step() # Ensure all processes finish before exiting
 
 
-# --- Main Execution ---
+# --- Main Execution (MODIFIED TO LOAD DATA AND PASS TO SPAWNED PROCESSES) ---
 if __name__ == '__main__':
-    # This block handles initial setup that should only happen once
-    # and load global variables before spawning processes.
+    # Define image subfolders for metadata loading (these are static)
+    gcs_image_subfolders = [f"images_{i:03}" for i in range(1, 13)]
 
-    if data_entry_df is None or mlb is None or not gcs_blob_map_names:
-        print("ERROR: Metadata not loaded properly. Cannot proceed.")
-        exit(1)
+    # Load all metadata in the main process
+    print("\n--- Main Process: Loading all metadata ---")
+    global_bbox_df, global_bbox_dict, global_data_entry_df, global_mlb, global_unique_labels_list, global_num_classes, global_gcs_blob_map_names = \
+        load_global_metadata(GCP_PROJECT_ID, GCS_BUCKET_NAME, GCS_BBOX_CSV_PATH, GCS_DATA_ENTRY_CSV_PATH, GCS_IMAGE_BASE_PREFIX, gcs_image_subfolders)
+    print("Main Process: All metadata loaded successfully.")
 
+    # Prepare shared metadata tuple to pass to spawned processes
+    shared_metadata = (
+        global_bbox_df, global_bbox_dict, global_data_entry_df, global_mlb,
+        global_unique_labels_list, global_num_classes, global_gcs_blob_map_names
+    )
+
+    # Pre-download/cache Hugging Face model
     try:
         print("Main process: Pre-downloading/caching Hugging Face model to ensure all processes have it locally...")
         _ = ViTForImageClassification.from_pretrained(MODEL_NAME)
@@ -510,9 +506,8 @@ if __name__ == '__main__':
         print("Main process: Child processes might download concurrently, which could cause issues.")
 
     # Get the total number of available TPU cores.
-    # This is safe to call here because xmp.spawn is about to be called.
-    #world_size = xr.addressable_device_count()
-    #print(f"Starting TPU multiprocessing on {world_size} cores via xmp.spawn...")
+    world_size = xr.addressable_device_count()
+    print(f"Starting TPU multiprocessing on {world_size} cores via xmp.spawn...")
     
-    # Launch training on all TPU cores
-    xmp.spawn(_mp_fn, nprocs=None, start_method='spawn')
+    # Pass the shared_metadata tuple as an argument to _mp_fn
+    xmp.spawn(_mp_fn, args=(shared_metadata,), nprocs=None, start_method='spawn')
