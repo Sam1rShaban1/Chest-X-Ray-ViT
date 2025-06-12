@@ -50,6 +50,7 @@ import torch_xla
 import torch_xla.core.xla_model as xm # KEEP THIS
 import torch_xla.distributed.xla_multiprocessing as xmp # KEEP THIS
 import torch_xla.distributed.parallel_loader as pl # KEEP THIS
+import torch_xla.runtime as xr
 
 print("All necessary libraries imported.")
 
@@ -74,9 +75,9 @@ VIT_STD = [0.229, 0.224, 0.225]
 BATCH_SIZE_PER_CORE = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-NUM_EPOCHS = 4
+NUM_EPOCHS = 2
 
-USE_SUBSET_DATA = None
+USE_SUBSET_DATA = 500
 
 print("Configuration set.")
 
@@ -333,7 +334,7 @@ def _mp_fn(index): # 'index' is the rank for this process
     # Initialize TPU device and get rank/world_size
     device = xm.xla_device()
     rank = index # Use the 'index' passed by xmp.spawn as the rank
-    world_size = xm.xla_replica_count() # Get the number of replicas/cores from XLA runtime
+    world_size = xr.addressable_device_count()
     
     print(f"Process {rank}: Starting training on device {device} (World Size: {world_size})")
 
@@ -410,11 +411,11 @@ def _mp_fn(index): # 'index' is the rank for this process
       output_dir=os.path.join(OUTPUT_DIR, f"vit-finetune-chest-xray-rank{rank}"), # Unique output dir per rank for safety
       per_device_train_batch_size=BATCH_SIZE_PER_CORE,
       per_device_eval_batch_size=BATCH_SIZE_PER_CORE, # Add eval batch size
-      evaluation_strategy="steps", # This is the correct parameter name
+      eval_strategy="steps", # This is the correct parameter name
       num_train_epochs=NUM_EPOCHS,
-      bf16=True, # CORRECT: Use bfloat16 for TPUs
-      save_steps=500, # Increased save frequency for larger datasets
-      eval_steps=500, # Increased eval frequency
+      #bf16=True, # CORRECT: Use bfloat16 for TPUs
+      save_steps=50, # Increased save frequency for larger datasets
+      eval_steps=50, # Increased eval frequency
       logging_steps=50, # Log more frequently
       learning_rate=LEARNING_RATE,
       weight_decay=WEIGHT_DECAY,
@@ -439,7 +440,7 @@ def _mp_fn(index): # 'index' is the rank for this process
         compute_metrics=_compute_metrics,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        tokenizer=local_image_processor,
+        processing_class=local_image_processor,
     )
 
     print(f"Process {rank}: Starting training with Trainer...")
@@ -484,8 +485,8 @@ if __name__ == '__main__':
 
     # Get the total number of available TPU cores.
     # This is safe to call here because xmp.spawn is about to be called.
-    world_size = xm.xla_device_count()
-    print(f"Starting TPU multiprocessing on {world_size} cores via xmp.spawn...")
+    #world_size = xr.addressable_device_count()
+    #print(f"Starting TPU multiprocessing on {world_size} cores via xmp.spawn...")
     
     # Launch training on all TPU cores
-    xmp.spawn(_mp_fn, nprocs=world_size, start_method='fork')
+    xmp.spawn(_mp_fn, nprocs=None, start_method='spawn')
