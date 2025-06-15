@@ -1,14 +1,8 @@
-"""
-A robust and validated script to fine-tune google/vit-base-patch16-384
-on the NIH Chest X-ray dataset using PyTorch 2.0 and PyTorch/XLA for a TPU v4-8.
-
-This script is designed for correctness and is validated against official Hugging Face
-and Google Cloud documentation.
-"""
-
 import os
 import torch
 import numpy as np
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
 from datasets import load_dataset, DatasetDict
 from transformers import (
     ViTForImageClassification,
@@ -27,29 +21,21 @@ from torchvision.transforms import (
 )
 from sklearn.metrics import f1_score, roc_auc_score, classification_report
 
-def main():
-    # --- 1. Configuration: All settings in one place ---
+# --- This function will contain all the logic that runs on each TPU core ---
+def _mp_fn(index, flags):
+    """
+    The main training function that gets spawned on each TPU core.
+    'index' is the process rank, from 0 to 7.
+    'flags' is a dictionary containing our configuration.
+    """
+    print(f"--> Starting process with rank {index}...")
     
-    # Model and Dataset
-    MODEL_NAME = "google/vit-base-patch16-384"
-    DATASET_NAME = "kerem/nih-chest-xray-14"
-    OUTPUT_DIR = "./nih-xray-vit-base-384-finetuned"
+    # --- 1. Data Loading and Preparation ---
+    # The master process (rank 0) downloads the data. Others wait.
+    if not xm.is_master_ordinal():
+        xm.rendezvous('download_only_once')
     
-    # Training Hyperparameters
-    TRAIN_BATCH_SIZE = 32
-    EVAL_BATCH_SIZE = 64
-    NUM_TRAIN_EPOCHS = 5  # Increase for better performance, e.g., to 10
-    LEARNING_RATE = 2e-5
-    WARMUP_RATIO = 0.1
-    WEIGHT_DECAY = 0.01
-    
-    # Dataloader optimization for powerful host VM
-    DATALOADER_NUM_WORKERS = os.cpu_count() // 2
-    
-    # --- 2. Data Loading and Preparation ---
-    print("--- Loading and preparing dataset ---")
-    
-    dataset = load_dataset(DATASET_NAME)
+    dataset = load_dataset(flags['dataset_name'])
     train_test_split = dataset["train"].train_test_split(test_size=0.2, seed=42)
     test_val_split = train_test_split["test"].train_test_split(test_size=0.5, seed=42)
 
@@ -59,32 +45,22 @@ def main():
         "test": test_val_split["test"],
     })
     
+    if xm.is_master_ordinal():
+        xm.rendezvous('download_only_once')
+
     class_names = dataset["train"].features['labels'].feature.names
     num_classes = len(class_names)
     id2label = {i: label for i, label in enumerate(class_names)}
     label2id = {label: i for i, label in id2label.items()}
 
-    # --- 3. Image Processing ---
-    print("--- Setting up image processor and transforms ---")
-
-    processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
+    # --- 2. Image Processing ---
+    processor = ViTImageProcessor.from_pretrained(flags['model_name'])
     image_mean, image_std = processor.image_mean, processor.image_std
     size = processor.size["height"]
     normalize = Normalize(mean=image_mean, std=image_std)
 
-    train_transforms = Compose([
-        RandomResizedCrop(size),
-        RandomHorizontalFlip(),
-        ToTensor(),
-        normalize,
-    ])
-
-    val_transforms = Compose([
-        Resize(size),
-        CenterCrop(size),
-        ToTensor(),
-        normalize,
-    ])
+    train_transforms = Compose([RandomResizedCrop(size), RandomHorizontalFlip(), ToTensor(), normalize])
+    val_transforms = Compose([Resize(size), CenterCrop(size), ToTensor(), normalize])
 
     def apply_train_transforms(examples):
         examples["pixel_values"] = [train_transforms(img.convert("RGB")) for img in examples["image"]]
@@ -103,11 +79,9 @@ def main():
         labels = torch.tensor([example["labels"] for example in examples], dtype=torch.float)
         return {"pixel_values": pixel_values, "labels": labels}
 
-    # --- 4. Model and Training Configuration ---
-    print("--- Configuring model and training arguments ---")
-
+    # --- 3. Model and Training Configuration ---
     model = ViTForImageClassification.from_pretrained(
-        MODEL_NAME,
+        flags['model_name'],
         num_labels=num_classes,
         id2label=id2label,
         label2id=label2id,
@@ -116,28 +90,20 @@ def main():
     )
 
     training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=TRAIN_BATCH_SIZE,
-        per_device_eval_batch_size=EVAL_BATCH_SIZE,
-        num_train_epochs=NUM_TRAIN_EPOCHS,
-        learning_rate=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-        lr_scheduler_type="linear",
-        warmup_ratio=WARMUP_RATIO,
+        output_dir=flags['output_dir'],
+        per_device_train_batch_size=flags['train_batch_size'],
+        per_device_eval_batch_size=flags['eval_batch_size'],
+        num_train_epochs=flags['num_train_epochs'],
+        learning_rate=flags['learning_rate'],
         evaluation_strategy="epoch",
         logging_strategy="steps",
         logging_steps=100,
-        save_strategy="steps",
-        save_steps=500,
-        save_total_limit=3,
+        save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1_micro",
         greater_is_better=True,
-        bf16=True, # Natively supported and faster on TPU v3+
-        tpu_num_cores=8,
-        dataloader_num_workers=DATALOADER_NUM_WORKERS,
-        dataloader_persistent_workers=True,
-        dataloader_pin_memory=True,
+        bf16=True,
+        tpu_num_cores=flags['num_workers'],
         seed=42,
         remove_unused_columns=True,
         report_to="none",
@@ -148,11 +114,8 @@ def main():
         sigmoid = torch.nn.Sigmoid()
         probs = sigmoid(torch.Tensor(logits))
         predictions = (probs >= 0.5).int().cpu().numpy()
-        
         f1_micro = f1_score(y_true=labels, y_pred=predictions, average="micro", zero_division=0)
-        roc_auc_micro = roc_auc_score(y_true=labels, y_score=probs.cpu().numpy(), average="micro")
-        
-        return {"f1_micro": f1_micro, "roc_auc_micro": roc_auc_micro}
+        return {"f1_micro": f1_micro}
 
     trainer = Trainer(
         model=model,
@@ -161,50 +124,47 @@ def main():
         eval_dataset=dataset["validation"],
         compute_metrics=compute_metrics,
         data_collator=collate_fn,
-        # Validated against docs: `processing_class` is the correct, modern argument
         processing_class=processor,
     )
 
-    # --- 5. Start Training ---
-    print("\n--- Starting model training on TPU v4 ---")
+    # --- 4. Start Training ---
+    print(f"Rank {index}: Starting training...")
+    trainer.train()
     
-    # Using resume_from_checkpoint=True ensures fault tolerance.
-    # If the script is interrupted, it will automatically resume from the last save.
-    train_results = trainer.train(resume_from_checkpoint=True)
-    
-    # --- 6. Save, Evaluate, and Report (on main process only) ---
-    if trainer.is_world_process_zero():
-        print("\n--- Saving final model and metrics ---")
-        trainer.save_model()
-        trainer.save_state()
-        trainer.log_metrics("train", train_results.metrics)
-        trainer.save_metrics("train", train_results.metrics)
-
-        print("\n--- Evaluating on test set ---")
+    # --- 5. Evaluate and Save (on main process only) ---
+    if xm.is_master_ordinal():
+        print("--- Master process: Evaluating on test set ---")
         test_results = trainer.predict(dataset["test"])
-        trainer.log_metrics("test", test_results.metrics)
-        trainer.save_metrics("test", test_results.metrics)
-
-        # Generate and save final classification report
+        
         logits = test_results.predictions
         y_true = test_results.label_ids
         sigmoid = torch.nn.Sigmoid()
         probs = sigmoid(torch.Tensor(logits))
         y_pred = (probs >= 0.5).int().cpu().numpy()
 
-        print("\n--- Final Classification Report ---")
         report = classification_report(y_true, y_pred, target_names=class_names, zero_division=0)
-        print(report)
         
-        with open(os.path.join(OUTPUT_DIR, "classification_report.txt"), "w") as f:
-            f.write("Test Metrics:\n")
-            for key, value in test_results.metrics.items():
-                f.write(f"{key}: {value}\n")
-            f.write("\n\nClassification Report:\n")
+        with open(os.path.join(flags['output_dir'], "final_classification_report.txt"), "w") as f:
             f.write(report)
-            
-        print(f"\n--- Training complete. Results saved in: {OUTPUT_DIR} ---")
+        print(f"Final report saved to {flags['output_dir']}/final_classification_report.txt")
+        
+    print(f"--- Rank {index}: Finished ---")
 
 
-if __name__ == "__main__":
-    main()
+# --- This is the main entry point of the script ---
+if __name__ == '__main__':
+    # Configuration flags
+    config = {
+        "model_name": "google/vit-base-patch16-384",
+        "dataset_name": "kerem/nih-chest-xray-14",
+        "output_dir": "./nih-xray-vit-programmatic-finetuned",
+        "train_batch_size": 32,
+        "eval_batch_size": 64,
+        "num_train_epochs": 5,
+        "learning_rate": 2e-5,
+        "num_workers": 8, # Number of TPU cores
+    }
+    
+    # This is the programmatic spawn call you found in the documentation.
+    # It will start the `_mp_fn` function on `num_workers` different processes.
+    xmp.spawn(_mp_fn, args=(config,), nprocs=config['num_workers'], start_method='fork')
