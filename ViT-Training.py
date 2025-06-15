@@ -167,4 +167,4 @@ if __name__ == '__main__':
     
     # This is the programmatic spawn call you found in the documentation.
     # It will start the `_mp_fn` function on `num_workers` different processes.
-    xmp.spawn(_mp_fn, args=(config,), nprocs=config['num_workers'], start_method='fork')
+    xmp.spawn(_mp_fn, args=(config,), nprocs=None, start_method='fork')
