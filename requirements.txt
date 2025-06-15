@@ -1,23 +1,13 @@
-# Core PyTorch and XLA libraries
-# Run this in VM CLI
-#pip install --upgrade torch_xla torch torchvision -f https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla_releases.html
-
-# Other core deep learning libraries
+# Hugging Face ecosystem libraries
+datasets
 transformers
 accelerate
 
-# TensorFlow (CPU-only to avoid CUDA conflicts on TPU VMs)
-tensorflow-cpu
-
-# Cloud TPU client (often helpful on TPU VMs)
-cloud-tpu-client
-
-# Data handling and utility libraries
-numpy
-pandas
-Pillow
-matplotlib
+# For metrics calculation
 scikit-learn
-google-cloud-storage
-tqdm
-libtpu
+
+# Core numerical library
+numpy
+
+# For plotting/visualization
+matplotlib
